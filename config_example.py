@@ -5,6 +5,8 @@
 
 DHAN_CLIENT_ID = "तुमचा_CLIENT_ID"
 DHAN_ACCESS_TOKEN = "इथे_नवीन_TOKEN_पेस्ट_करा"
+DHAN_PIN = ""              # setup_totp.py भरेल — GitHub वर कधीच भरू नका
+DHAN_TOTP_SECRET = ""      # setup_totp.py भरेल — GitHub वर कधीच भरू नका
 
 PAPER_MODE = True          # True = खोट्या ऑर्डर (टेस्ट)   |   False = खऱ्या ऑर्डर (LIVE)
 

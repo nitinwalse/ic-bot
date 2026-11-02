@@ -2,7 +2,7 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.0  (02-11-2026)
+ Version : V1.0.1 (02-11-2026) — TOTP auto token
  Broker  : Dhan (dhanhq 2.3.x — DhanContext पद्धत)
  Server  : AWS EC2 (Ubuntu)
  Mode    : PAPER (खोट्या ऑर्डर) / LIVE (खऱ्या ऑर्डर) — config.py मध्ये
@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.0"
+import hmac, hashlib, base64, struct, re
+BOT_VERSION = "V1.0.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -86,6 +87,8 @@ def read_config():
     cfg["HOLIDAYS"] = list(ns.get("HOLIDAYS", []))
     cfg["TELEGRAM_BOT_TOKEN"] = str(ns.get("TELEGRAM_BOT_TOKEN", "") or "")
     cfg["TELEGRAM_CHAT_ID"] = str(ns.get("TELEGRAM_CHAT_ID", "") or "")
+    cfg["DHAN_PIN"] = str(ns.get("DHAN_PIN", "") or "").strip()
+    cfg["DHAN_TOTP_SECRET"] = str(ns.get("DHAN_TOTP_SECRET", "") or "").replace(" ", "").strip().upper()
     return cfg
 
 
@@ -113,6 +116,68 @@ def reload_token_if_changed():
         CFG["TELEGRAM_CHAT_ID"] = new["TELEGRAM_CHAT_ID"]
     except Exception as e:
         log(f"config.py वाचताना चूक: {e}")
+
+
+# ---------------- TOTP ने आपोआप Token (V1.0.1) ----------------
+_last_token_try = 0.0
+_token_day = None
+
+
+def totp_enabled():
+    return bool(CFG.get("DHAN_PIN")) and bool(CFG.get("DHAN_TOTP_SECRET"))
+
+
+def totp_now(secret):
+    s = secret.replace(" ", "").upper()
+    s += "=" * ((8 - len(s) % 8) % 8)
+    key = base64.b32decode(s)
+    if 30 - (int(time.time()) % 30) < 3:
+        time.sleep(4)
+    counter = int(time.time()) // 30
+    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000
+    return f"{code:06d}"
+
+
+def save_token_to_config(tok):
+    global CFG_MTIME
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        txt = f.read()
+    txt = re.sub(r'^DHAN_ACCESS_TOKEN\s*=\s*".*$', lambda m: f'DHAN_ACCESS_TOKEN = "{tok}"', txt, count=1, flags=re.M)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.write(txt)
+    CFG_MTIME = os.path.getmtime(CONFIG_FILE)
+
+
+def refresh_token(reason):
+    """PIN + TOTP ने Dhan कडून नवीन Access Token. यश मिळालं तर True."""
+    global _last_token_try, _token_day
+    if not totp_enabled():
+        return False
+    if time.time() - _last_token_try < 600:
+        return False
+    _last_token_try = time.time()
+    try:
+        code = totp_now(CFG["DHAN_TOTP_SECRET"])
+        r = requests.post("https://auth.dhan.co/app/generateAccessToken",
+                          params={"dhanClientId": str(CFG["DHAN_CLIENT_ID"]), "pin": CFG["DHAN_PIN"], "totp": code},
+                          timeout=20)
+        j = r.json() if r.content else {}
+        d = j.get("data") if isinstance(j.get("data"), dict) else {}
+        tok = j.get("accessToken") or j.get("access_token") or d.get("accessToken")
+        if not tok:
+            alert(f"❌ TOTP ने Token मिळाला नाही ({reason}): {j}")
+            return False
+        CFG["DHAN_ACCESS_TOKEN"] = tok
+        save_token_to_config(tok)
+        build_client()
+        _token_day = today_str()
+        alert(f"🔑 नवीन Token TOTP ने आपोआप तयार ✅ ({reason}) | मुदत: {j.get('expiryTime', '२४ तास')}")
+        return True
+    except Exception as e:
+        alert(f"❌ TOTP Token error ({reason}): {e}")
+        return False
 
 
 # ---------------- Telegram ----------------
@@ -208,6 +273,8 @@ def unwrap(res, what=""):
         rem = res.get("remarks")
         log(f"{what} अयशस्वी: {rem}")
         txt = json.dumps(rem, ensure_ascii=False) if rem else ""
+        if "DH-901" in txt and refresh_token("Token बाद (DH-901)"):
+            return None
         if any(x in txt for x in ("DH-901", "DH-905", "Invalid", "invalid", "expired", "Expired", "IP")):
             if time.time() - _last_auth_alert > 900:
                 _last_auth_alert = time.time()
@@ -679,8 +746,10 @@ def startup_checks():
         f = unwrap(dhan.get_fund_limits(), "Fund limits")
         if isinstance(f, dict):
             log(f"✅ Token बरोबर आहे. Available margin: {f.get('availabelBalance', f.get('availableBalance'))}")
+        elif _token_day == today_str():
+            log("✅ जुना Token बाद होता — TOTP ने नवीन Token घेतला.")
         else:
-            alert("❌ Token तपासणी अयशस्वी — config.py मध्ये नवीन token टाका.")
+            alert("❌ Token तपासणी अयशस्वी — TOTP सेटअप पुन्हा करा: python3 setup_totp.py")
     except Exception as e:
         log(f"Fund check error: {e}")
     try:
@@ -717,6 +786,8 @@ def main():
                 reload_token_if_changed()
             check_control_files()
             n = now()
+            if totp_enabled() and is_trading_day(n) and hm(n) >= (8, 45) and _token_day != today_str():
+                refresh_token("रोजचा सकाळचा Token")
 
             if state["halted"]:
                 if time.time() - last_halt_log > 300:
