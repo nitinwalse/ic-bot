@@ -22,3 +22,7 @@ HOLIDAYS = ["2026-11-24", "2026-12-25"]
 # Telegram alert (ऐच्छिक — रिकामे ठेवले तर alert जाणार नाहीत)
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
+
+# --- दुप्पट पेस्ट झालेला Token आपोआप दुरुस्त (या ओळींना हात लावू नका) ---
+DHAN_ACCESS_TOKEN = DHAN_ACCESS_TOKEN.strip()
+if len(DHAN_ACCESS_TOKEN) % 2 == 0 and DHAN_ACCESS_TOKEN[:len(DHAN_ACCESS_TOKEN)//2] == DHAN_ACCESS_TOKEN[len(DHAN_ACCESS_TOKEN)//2:]: DHAN_ACCESS_TOKEN = DHAN_ACCESS_TOKEN[:len(DHAN_ACCESS_TOKEN)//2]
