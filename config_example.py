@@ -1,0 +1,24 @@
+# ================= Nitin Iron Condor Bot — config.py =================
+# फक्त या file मध्ये बदल करायचे. bot.py ला हात लावायचा नाही.
+# बदल केल्यावर: Token बदलला तर बॉट आपोआप घेतो (restart नको).
+# बाकी कोणताही बदल केला तर:  sudo systemctl restart icbot
+
+DHAN_CLIENT_ID = "तुमचा_CLIENT_ID"
+DHAN_ACCESS_TOKEN = "इथे_नवीन_TOKEN_पेस्ट_करा"
+
+PAPER_MODE = True          # True = खोट्या ऑर्डर (टेस्ट)   |   False = खऱ्या ऑर्डर (LIVE)
+
+LOTS = 8                   # NIFTY लॉट
+LOT_SIZE = 65              # NIFTY चा १ लॉट
+DEPLOYED_CAPITAL = 600000  # ₹ भांडवल
+PROFIT_TARGET_PCT = 1.25   # एकूण नफा या % ला पोहोचला की पूर्ण एक्झिट
+MAX_SL_PCT = 1.25          # एकूण तोटा या % ला पोहोचला की पूर्ण एक्झिट
+HEDGE_DISTANCE = 200       # Short strike पासून Hedge किती points बाहेर
+REENTRY_WAIT_MIN = 5       # Target/SL/Strike-limit नंतर किती मिनिटांनी री-एंट्री
+
+# NSE सुट्ट्या (YYYY-MM-DD) — NSE च्या वेबसाईटवर तपासून यादी पूर्ण करा
+HOLIDAYS = ["2026-11-24", "2026-12-25"]
+
+# Telegram alert (ऐच्छिक — रिकामे ठेवले तर alert जाणार नाहीत)
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
