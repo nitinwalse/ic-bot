@@ -2,7 +2,9 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.3  (03-11-2026)
+ Version : V1.5  (03-11-2026)
+   + ३:१० ची दिवसअखेर तपासणी: Short premium फरक ≥ 1.65x असेल तर आजच ॲडजस्टमेंट
+   + Target बुक झाल्यावर १५ सेकंदांनी नवीन एंट्री (TARGET_REENTRY_SEC)
    + Stop-loss बंद (USE_STOPLOSS = False): फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट
    + तोट्याचे इशारे (फक्त माहिती) + Hedge-आधारित कमाल धोका /status मध्ये
    + Liquidity तपासणी: 15Δ/200 liquid नसेल तर 20Δ/100 चा पर्याय Telegram वर (/yes ने एंट्री)
@@ -33,7 +35,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.3"
+BOT_VERSION = "V1.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -68,7 +70,8 @@ OPTIONAL_KEYS = {"HOLIDAYS": [], "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "
                  "SHEET_WEBHOOK_URL": "", "SHEET_SECRET": "", "DHAN_PIN": "", "DHAN_TOTP_SECRET": ""}
 NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT": 5.0,
             "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True,
-            "USE_STOPLOSS": False, "LOSS_ALERT_STEP_PCT": 1.25}
+            "USE_STOPLOSS": False, "LOSS_ALERT_STEP_PCT": 1.25, "TARGET_REENTRY_SEC": 15,
+            "EOD_RATIO": 1.65, "EOD_CHECK_HHMM": 1510}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
 
 # ---------------- Logging (IST वेळेत) ----------------
@@ -277,7 +280,7 @@ def blank_state():
             "reentry_at": 0.0, "entry_time": None, "no_entry_alert_day": None,
             "imbalance": None, "extra_noted": [], "summary_day": None,
             "entry_pending": None, "skip_entry_day": None, "last_hourly": None,
-            "plan": "", "hedge_dist": 0, "loss_alert_level": 0}
+            "plan": "", "hedge_dist": 0, "eod_check_day": None, "loss_alert_level": 0}
 
 
 state = blank_state()
@@ -817,8 +820,10 @@ def current_ltps():
     return spot, oc, out
 
 
-def schedule_reentry(msg):
-    at = time.time() + float(CFG["REENTRY_WAIT_MIN"]) * 60
+def schedule_reentry(msg, wait_sec=None):
+    if wait_sec is None:
+        wait_sec = float(CFG["REENTRY_WAIT_MIN"]) * 60
+    at = time.time() + float(wait_sec)
     at_dt = datetime.fromtimestamp(at, IST)
     if hm(at_dt) < LAST_NEW_ENTRY:
         state["reentry_at"] = at
@@ -843,7 +848,7 @@ def full_exit(reason, reentry, ltps=None, qtys=None):
     sheet_trade("CLOSED", 0.0, state["realized"], reason)
     msg = f"🔴 ट्रेड {trade_id()} बंद | कारण: {reason} | शिफ्ट: {state['shifts']} | Net P&L: ₹{state['realized']:.2f}"
     if reentry:
-        msg = schedule_reentry(msg)
+        msg = schedule_reentry(msg, None if reentry is True else reentry)
     save_state()
     alert(msg)
 
@@ -891,7 +896,7 @@ def monitor():
         return
 
     if net >= target_amt():
-        full_exit(f"Target +{CFG['PROFIT_TARGET_PCT']}% (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
+        full_exit(f"Target +{CFG['PROFIT_TARGET_PCT']}% (Net ₹{net:.0f})", int(CFG["TARGET_REENTRY_SEC"]) or 1, ltp, imbalance_qtys())
         return
     if sl_on() and net <= -sl_amt():
         full_exit(f"Max SL -{CFG['MAX_SL_PCT']}% (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
@@ -982,7 +987,7 @@ def execute_shift(side, new_k, new_ltp, sid, ltp, typ, target_note=""):
     return True
 
 
-def auto_shift(side, target_prem, spot, oc, ltp):
+def auto_shift(side, target_prem, spot, oc, ltp, typ="SHIFT"):
     new_k, new_ltp, sid, err = plan_shift(side, spot, oc, target_prem=target_prem)
     if err and err.startswith("Strike Limit"):
         full_exit(f"Strike Limit (नियम ५.४): {err}", True, ltp)
@@ -990,7 +995,34 @@ def auto_shift(side, target_prem, spot, oc, ltp):
     if err:
         log(f"शिफ्ट पुढे ढकलली: {err}")
         return
-    execute_shift(side, new_k, new_ltp, sid, ltp, "SHIFT", f"(हवा होता {target_prem})")
+    execute_shift(side, new_k, new_ltp, sid, ltp, typ, f"(हवा होता {target_prem})")
+
+
+def eod_check():
+    """३:१० ची दिवसअखेर तपासणी: मोठा premium ≥ 1.65 × लहान असेल तर आजच ॲडजस्टमेंट."""
+    state["eod_check_day"] = today_str()
+    save_state()
+    spot, oc, ltp = current_ltps()
+    if not spot or ltp.get("CE_S", 0) <= 0 or ltp.get("PE_S", 0) <= 0:
+        alert("🕒 ३:१० तपासणी: भाव मिळाले नाहीत — आज तपासणी झाली नाही.")
+        return
+    for r in ("CE_H", "PE_H"):
+        if r in state["legs"] and ltp.get(r, 0) <= 0:
+            ltp[r] = state["legs"][r]["entry"]
+    ce, pe = ltp["CE_S"], ltp["PE_S"]
+    big, small = max(ce, pe), min(ce, pe)
+    ratio = big / small if small > 0 else 0
+    thr = float(CFG["EOD_RATIO"])
+    L = state["legs"]
+    head = (f"🕒 ३:१० दिवसअखेर तपासणी ({trade_id()}): CE {L['CE_S']['strike']} @{ce} | PE {L['PE_S']['strike']} @{pe}"
+            f" → फरक {ratio:.3f}x (मर्यादा {thr}x)")
+    if state.get("imbalance"):
+        return alert(head + "\n⚠️ Qty असंतुलन चालू आहे — ॲडजस्टमेंट नाही.")
+    if ratio + 1e-9 < thr:
+        return alert(head + "\n✅ मर्यादेपेक्षा कमी — आज ॲडजस्टमेंट नाही.")
+    side = "CE" if ce < pe else "PE"
+    alert(head + f"\n⚡ मर्यादा ओलांडली → लहान बाजू {side} बुक करून {big} च्या जवळचा strike विकत आहे.")
+    auto_shift(side, big, spot, oc, ltp, "EOD-ADJ")
 
 
 # ---------------- Broker Match (फक्त LIVE) ----------------
@@ -1259,9 +1291,9 @@ def settings_text():
     return (f"⚙️ {BOT_VERSION} | {'PAPER' if PAPER else 'LIVE'}\nLots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY}\n"
             f"Capital ₹{CFG['DEPLOYED_CAPITAL']} | Target {CFG['PROFIT_TARGET_PCT']}% | "
             f"{('SL ' + str(CFG['MAX_SL_PCT']) + '%') if sl_on() else 'SL: बंद'} | तोटा इशारा दर {CFG['LOSS_ALERT_STEP_PCT']}%\n"
-            f"Hedge {CFG['HEDGE_DISTANCE']} pts | री-एंट्री {CFG['REENTRY_WAIT_MIN']} मि. | Balance वेळ {BALANCE_WAIT_MIN} मि.\n"
+            f"Hedge {CFG['HEDGE_DISTANCE']} pts | री-एंट्री: Target नंतर {CFG['TARGET_REENTRY_SEC']} सेकंद, Strike Limit नंतर {CFG['REENTRY_WAIT_MIN']} मि. | Balance वेळ {BALANCE_WAIT_MIN} मि.\n"
             f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | पर्याय {CFG['FALLBACK_DELTA']:.0f}Δ / {CFG['FALLBACK_HEDGE']} OTM\n"
-            f"दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'}\n"
+            f"दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'} | दिवसअखेर तपासणी {int(CFG['EOD_CHECK_HHMM']) // 100}:{int(CFG['EOD_CHECK_HHMM']) % 100:02d} ≥ {CFG['EOD_RATIO']}x\n"
             f"Gap निरीक्षण ९:१५-९:१७ | TOTP: {'✅' if totp_enabled() else '❌'} | Sheet: {'✅' if CFG.get('SHEET_WEBHOOK_URL') else '❌'}")
 
 
@@ -1571,7 +1603,11 @@ def main():
                 broker_check()
                 if state["in_trade"] and not state["halted"]:
                     monitor()
-                    if state["imbalance"] and time.time() >= state["imbalance"]["deadline"]:
+                    eh, em = divmod(int(CFG["EOD_CHECK_HHMM"]), 100)
+                    if state["in_trade"] and not state["halted"] and hm(n) >= (eh, em) \
+                            and state.get("eod_check_day") != t:
+                        eod_check()
+                    if state["in_trade"] and state["imbalance"] and time.time() >= state["imbalance"]["deadline"]:
                         broker_check()
             time.sleep(LOOP_SLEEP)
         except KeyboardInterrupt:

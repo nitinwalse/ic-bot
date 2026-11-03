@@ -30,6 +30,9 @@ HOURLY_STATUS = True       # दर तासाला (१०:०० ते ३
 # ---- Stop-loss (V1.3) ----
 USE_STOPLOSS = False       # False = SL बंद: फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट  |  True = MAX_SL_PCT ला एक्झिट
 LOSS_ALERT_STEP_PCT = 1.25 # SL बंद असताना तोटा दर एवढ्या % ने वाढला की Telegram इशारा (एक्झिट नाही)
+TARGET_REENTRY_SEC = 15    # Target बुक झाल्यावर किती सेकंदांनी नवीन एंट्री
+EOD_RATIO = 1.65           # दिवसअखेर तपासणी: मोठा premium ≥ एवढे × लहान असेल तर आजच ॲडजस्टमेंट
+EOD_CHECK_HHMM = 1510      # तपासणीची वेळ (१५:१०)
 
 # NSE सुट्ट्या (YYYY-MM-DD) — NSE च्या वेबसाईटवर तपासून यादी पूर्ण करा
 HOLIDAYS = ["2026-11-24", "2026-12-25"]
