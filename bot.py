@@ -2,7 +2,9 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.2  (03-11-2026)
+ Version : V1.3  (03-11-2026)
+   + Stop-loss बंद (USE_STOPLOSS = False): फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट
+   + तोट्याचे इशारे (फक्त माहिती) + Hedge-आधारित कमाल धोका /status मध्ये
    + Liquidity तपासणी: 15Δ/200 liquid नसेल तर 20Δ/100 चा पर्याय Telegram वर (/yes ने एंट्री)
    + दर तासाला ट्रेड status Telegram वर
    + Telegram रिपोर्ट आणि commands (/status /exit /adjust ...)
@@ -31,7 +33,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.2"
+BOT_VERSION = "V1.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -65,7 +67,8 @@ REQUIRED_KEYS = ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN", "PAPER_MODE", "LOTS", "L
 OPTIONAL_KEYS = {"HOLIDAYS": [], "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "",
                  "SHEET_WEBHOOK_URL": "", "SHEET_SECRET": "", "DHAN_PIN": "", "DHAN_TOTP_SECRET": ""}
 NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT": 5.0,
-            "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True}
+            "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True,
+            "USE_STOPLOSS": False, "LOSS_ALERT_STEP_PCT": 1.25}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
 
 # ---------------- Logging (IST वेळेत) ----------------
@@ -274,7 +277,7 @@ def blank_state():
             "reentry_at": 0.0, "entry_time": None, "no_entry_alert_day": None,
             "imbalance": None, "extra_noted": [], "summary_day": None,
             "entry_pending": None, "skip_entry_day": None, "last_hourly": None,
-            "plan": "", "hedge_dist": 0}
+            "plan": "", "hedge_dist": 0, "loss_alert_level": 0}
 
 
 state = blank_state()
@@ -742,7 +745,7 @@ def place_entry(legs, bw, mid, plan_name, hd, source):
     # नवीन ट्रेड नंबर (Sheet मधला Trade ID यावरून)
     state["trade_no"] += 1
     state.update({"legs": {}, "realized": 0.0, "shifts": 0, "expiry": bw, "rollover": mid,
-                  "imbalance": None, "extra_noted": [], "plan": plan_name, "hedge_dist": hd,
+                  "imbalance": None, "extra_noted": [], "plan": plan_name, "hedge_dist": hd, "loss_alert_level": 0,
                   "entry_time": now().strftime("%Y-%m-%d %H:%M:%S")})
     save_state()
 
@@ -771,7 +774,7 @@ def place_entry(legs, bw, mid, plan_name, hd, source):
     alert(f"🟢 नवीन ट्रेड {trade_id()} ({source}) | प्लॅन: {plan_name}\nExpiry {bw} | Rollover {mid}\n"
           f"Hedge BUY: {L['CE_H']['strike']} CE @{L['CE_H']['entry']} , {L['PE_H']['strike']} PE @{L['PE_H']['entry']}\n"
           f"Short SELL: {L['CE_S']['strike']} CE @{L['CE_S']['entry']} , {L['PE_S']['strike']} PE @{L['PE_S']['entry']}\n"
-          f"Qty {QTY} | Target +₹{target_amt():.0f} | SL -₹{sl_amt():.0f}")
+          f"Qty {QTY} | Target +₹{target_amt():.0f} | {sl_txt()}")
     return True
 
 
@@ -782,6 +785,27 @@ def target_amt():
 
 def sl_amt():
     return float(CFG["DEPLOYED_CAPITAL"]) * float(CFG["MAX_SL_PCT"]) / 100.0
+
+
+def sl_on():
+    return bool(CFG.get("USE_STOPLOSS")) and float(CFG["MAX_SL_PCT"]) > 0
+
+
+def sl_txt():
+    return f"SL -₹{sl_amt():.0f}" if sl_on() else "SL: बंद (फक्त ॲडजस्टमेंट)"
+
+
+def max_risk():
+    """expiry ला सगळ्यात वाईट स्थितीतला एकूण P&L (Hedge मुळे मर्यादित). (रक्कम, बाजू)"""
+    L = state["legs"]
+    if not all(r in L for r in ("CE_S", "PE_S", "CE_H", "PE_H")):
+        return None, ""
+    credit = (L["CE_S"]["entry"] + L["PE_S"]["entry"] - L["CE_H"]["entry"] - L["PE_H"]["entry"]) * QTY
+    w_ce = L["CE_H"]["strike"] - L["CE_S"]["strike"]
+    w_pe = L["PE_S"]["strike"] - L["PE_H"]["strike"]
+    ce_worst = state["realized"] + credit - w_ce * QTY
+    pe_worst = state["realized"] + credit - w_pe * QTY
+    return (ce_worst, f"CE बाजू, अंतर {w_ce}") if ce_worst < pe_worst else (pe_worst, f"PE बाजू, अंतर {w_pe}")
 
 
 def current_ltps():
@@ -857,7 +881,7 @@ def monitor():
     if time.time() - _last_status >= STATUS_EVERY_SEC:
         _last_status = time.time()
         log(f"STATUS {trade_id()} | Spot {spot:.2f} | CE {L['CE_S']['strike']} @{ltp['CE_S']} | PE {L['PE_S']['strike']} @{ltp['PE_S']} | "
-            f"Booked ₹{state['realized']:.0f} | Net ₹{net:.0f} | T +{target_amt():.0f} / SL -{sl_amt():.0f}")
+            f"Booked ₹{state['realized']:.0f} | Net ₹{net:.0f} | T +{target_amt():.0f} | {sl_txt()}")
     if time.time() - _last_sheet_status >= SHEET_STATUS_EVERY_SEC:
         _last_sheet_status = time.time()
         sheet_trade("OPEN", unreal, net)
@@ -869,9 +893,20 @@ def monitor():
     if net >= target_amt():
         full_exit(f"Target +{CFG['PROFIT_TARGET_PCT']}% (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
         return
-    if net <= -sl_amt():
+    if sl_on() and net <= -sl_amt():
         full_exit(f"Max SL -{CFG['MAX_SL_PCT']}% (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
         return
+    # SL बंद: तोट्याचे फक्त इशारे (प्रत्येक नवीन पायरीवर एकदा), एक्झिट नाही
+    step = float(CFG["DEPLOYED_CAPITAL"]) * float(CFG["LOSS_ALERT_STEP_PCT"]) / 100.0
+    if step > 0 and net < 0:
+        lvl = int(-net // step)
+        if lvl > int(state.get("loss_alert_level") or 0):
+            state["loss_alert_level"] = lvl
+            save_state()
+            risk, side = max_risk()
+            alert(f"⚠️ तोटा इशारा ({trade_id()}): Net ₹{net:.0f} (−₹{lvl * step:.0f} ची पायरी ओलांडली). SL बंद आहे — बॉट ॲडजस्टमेंट चालू ठेवेल.\n"
+                  + (f"Hedge मुळे expiry ला कमाल धोका: ₹{risk:.0f} ({side}).\n" if risk is not None else "")
+                  + "हाताने बंद करायचे असल्यास /exit")
 
     if state.get("imbalance"):      # असंतुलन असताना 2x शिफ्टिंग थांबलेली
         return
@@ -1155,7 +1190,11 @@ def status_text():
         if r in L:
             lines.append(f"{ROLE_NAME[r]}: {L[r]['strike']} | एंट्री {L[r]['entry']:.2f} | आत्ता {ltp.get(r, 0):.2f}")
     lines.append(f"Booked ₹{state['realized']:.0f} | Unbooked ₹{LAST['unreal']:.0f} | Net ₹{LAST['net']:.0f}")
-    lines.append(f"Target +₹{target_amt():.0f} (बाकी ₹{target_amt() - LAST['net']:.0f}) | SL -₹{sl_amt():.0f} (बाकी ₹{LAST['net'] + sl_amt():.0f})")
+    lines.append(f"Target +₹{target_amt():.0f} (बाकी ₹{target_amt() - LAST['net']:.0f}) | "
+                 + (f"SL -₹{sl_amt():.0f} (बाकी ₹{LAST['net'] + sl_amt():.0f})" if sl_on() else "SL: बंद"))
+    risk, side = max_risk()
+    if risk is not None:
+        lines.append(f"Hedge मुळे expiry ला कमाल धोका: ₹{risk:.0f} ({side})")
     return "\n".join(lines)
 
 
@@ -1218,7 +1257,8 @@ def positions_text():
 
 def settings_text():
     return (f"⚙️ {BOT_VERSION} | {'PAPER' if PAPER else 'LIVE'}\nLots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY}\n"
-            f"Capital ₹{CFG['DEPLOYED_CAPITAL']} | Target {CFG['PROFIT_TARGET_PCT']}% | SL {CFG['MAX_SL_PCT']}%\n"
+            f"Capital ₹{CFG['DEPLOYED_CAPITAL']} | Target {CFG['PROFIT_TARGET_PCT']}% | "
+            f"{('SL ' + str(CFG['MAX_SL_PCT']) + '%') if sl_on() else 'SL: बंद'} | तोटा इशारा दर {CFG['LOSS_ALERT_STEP_PCT']}%\n"
             f"Hedge {CFG['HEDGE_DISTANCE']} pts | री-एंट्री {CFG['REENTRY_WAIT_MIN']} मि. | Balance वेळ {BALANCE_WAIT_MIN} मि.\n"
             f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | पर्याय {CFG['FALLBACK_DELTA']:.0f}Δ / {CFG['FALLBACK_HEDGE']} OTM\n"
             f"दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'}\n"
@@ -1417,7 +1457,7 @@ def startup_checks():
     log("=" * 60)
     log(f"NIFTY 15Δ IRON CONDOR BOT {BOT_VERSION} | मोड: {'📝 PAPER (खोट्या ऑर्डर)' if PAPER else '💰 LIVE (खऱ्या ऑर्डर)'}")
     log(f"Lots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY} Qty | Capital ₹{CFG['DEPLOYED_CAPITAL']} | "
-        f"Target +₹{target_amt():.0f} | SL -₹{sl_amt():.0f} | Hedge {CFG['HEDGE_DISTANCE']} pts")
+        f"Target +₹{target_amt():.0f} | {sl_txt()} | Hedge {CFG['HEDGE_DISTANCE']} pts")
     tok = str(CFG["DHAN_ACCESS_TOKEN"])
     log(f"Client {CFG['DHAN_CLIENT_ID']} | Token {tok[:8]}...{tok[-6:]} | State: {os.path.basename(STATE_FILE)} | "
         f"TOTP {'✅' if totp_enabled() else '❌'} | Telegram {'✅' if CFG.get('TELEGRAM_CHAT_ID') else '❌'} | "

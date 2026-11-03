@@ -27,6 +27,10 @@ LIQ_MIN_OI = 0             # किमान OI (आत्ता बंद — P
 ENTRY_CONFIRM_MIN = 10     # पर्यायाला /yes देण्यासाठी किती मिनिटं
 HOURLY_STATUS = True       # दर तासाला (१०:०० ते ३:००) Telegram वर status
 
+# ---- Stop-loss (V1.3) ----
+USE_STOPLOSS = False       # False = SL बंद: फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट  |  True = MAX_SL_PCT ला एक्झिट
+LOSS_ALERT_STEP_PCT = 1.25 # SL बंद असताना तोटा दर एवढ्या % ने वाढला की Telegram इशारा (एक्झिट नाही)
+
 # NSE सुट्ट्या (YYYY-MM-DD) — NSE च्या वेबसाईटवर तपासून यादी पूर्ण करा
 HOLIDAYS = ["2026-11-24", "2026-12-25"]
 
