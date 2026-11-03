@@ -2,7 +2,8 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.5  (03-11-2026)
+ Version : V1.6  (04-11-2026)
+   + NSE सुट्ट्यांची यादी कोडमध्येच (१० नोव्हें. बलिप्रतिपदा, २४ नोव्हें., २५ डिसें.)
    + ३:१० ची दिवसअखेर तपासणी: Short premium फरक ≥ 1.65x असेल तर आजच ॲडजस्टमेंट
    + Target बुक झाल्यावर १५ सेकंदांनी नवीन एंट्री (TARGET_REENTRY_SEC)
    + Stop-loss बंद (USE_STOPLOSS = False): फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट
@@ -35,7 +36,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.5"
+BOT_VERSION = "V1.6"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -202,8 +203,13 @@ def hm(n=None):
     return (n.hour, n.minute)
 
 
+# NSE equity/F&O सुट्ट्या (कोडमध्ये कायम). config.py मधली HOLIDAYS यादी यात मिळवली जाते.
+NSE_HOLIDAYS = {"2026-11-10", "2026-11-24", "2026-12-25"}
+
+
 def is_trading_day(n):
-    return n.weekday() < 5 and n.strftime("%Y-%m-%d") not in CFG.get("HOLIDAYS", [])
+    d = n.strftime("%Y-%m-%d")
+    return n.weekday() < 5 and d not in NSE_HOLIDAYS and d not in CFG.get("HOLIDAYS", [])
 
 
 def market_open(n):
