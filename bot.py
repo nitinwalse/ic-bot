@@ -2,7 +2,9 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.1  (02-11-2026)
+ Version : V1.2  (03-11-2026)
+   + Liquidity तपासणी: 15Δ/200 liquid नसेल तर 20Δ/100 चा पर्याय Telegram वर (/yes ने एंट्री)
+   + दर तासाला ट्रेड status Telegram वर
    + Telegram रिपोर्ट आणि commands (/status /exit /adjust ...)
    + Google Sheet नोंदी (Orders + Trades, Trade ID)
    + Broker Match (तुमची qty वेगळी, १५ मिनिटांचा balancing नियम)
@@ -29,7 +31,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.1"
+BOT_VERSION = "V1.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -62,6 +64,8 @@ REQUIRED_KEYS = ["DHAN_CLIENT_ID", "DHAN_ACCESS_TOKEN", "PAPER_MODE", "LOTS", "L
                  "REENTRY_WAIT_MIN"]
 OPTIONAL_KEYS = {"HOLIDAYS": [], "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "",
                  "SHEET_WEBHOOK_URL": "", "SHEET_SECRET": "", "DHAN_PIN": "", "DHAN_TOTP_SECRET": ""}
+NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT": 5.0,
+            "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
 
 # ---------------- Logging (IST वेळेत) ----------------
@@ -102,6 +106,12 @@ def read_config():
         v = ns.get(k, dv)
         cfg[k] = list(v) if isinstance(dv, list) else str(v or "").strip()
     cfg["DHAN_TOTP_SECRET"] = cfg["DHAN_TOTP_SECRET"].replace(" ", "").upper()
+    for k, dv in NUM_KEYS.items():
+        v = ns.get(k, dv)
+        try:
+            cfg[k] = bool(v) if isinstance(dv, bool) else type(dv)(v)
+        except Exception:
+            cfg[k] = dv
     return cfg
 
 
@@ -262,7 +272,9 @@ def blank_state():
             "expiry": None, "rollover": None, "legs": {},
             "realized": 0.0, "shifts": 0, "trade_no": 0,
             "reentry_at": 0.0, "entry_time": None, "no_entry_alert_day": None,
-            "imbalance": None, "extra_noted": [], "summary_day": None}
+            "imbalance": None, "extra_noted": [], "summary_day": None,
+            "entry_pending": None, "skip_entry_day": None, "last_hourly": None,
+            "plan": "", "hedge_dist": 0}
 
 
 state = blank_state()
@@ -580,19 +592,40 @@ def journal(reason):
                 f"{state['realized']:.2f},\"{reason}\"\n")
 
 
-# ---------------- एंट्री (नियम २) ----------------
-def enter_trade(source):
-    mid, bw = get_expiries()
-    if not bw:
-        log("Expiry list मिळाली नाही — एंट्री नाही.")
-        return False
-    spot, oc = fetch_chain(bw)
-    if not spot:
-        return False
-    days = (datetime.strptime(bw, "%Y-%m-%d").date() - now().date()).days
-    T = max(days, 0.5) / 365.0
+# ---------------- Liquidity तपासणी ----------------
+def leg_liquidity(oc, strike, opt):
+    """(ok, कारण). bid/ask नसतील किंवा spread मोठा असेल तर illiquid."""
+    ltp, _, leg = leg_info(oc, strike, opt)
+    if ltp <= 0:
+        return False, "भाव नाही"
+    if "top_bid_price" not in leg and "top_ask_price" not in leg:
+        return True, ""          # Dhan ने bid/ask दिले नाहीत → तपासता येत नाही, चालू द्या
+    bid = float(leg.get("top_bid_price") or 0)
+    ask = float(leg.get("top_ask_price") or 0)
+    oi = float(leg.get("oi") or 0)
+    if bid <= 0 or ask <= 0:
+        return False, f"bid {bid}/ask {ask}"
+    lim = max(float(CFG["LIQ_MIN_SPREAD_RS"]), ltp * float(CFG["LIQ_MAX_SPREAD_PCT"]) / 100.0)
+    if ask - bid > lim:
+        return False, f"spread {ask - bid:.2f} > {lim:.2f}"
+    if oi < float(CFG["LIQ_MIN_OI"]):
+        return False, f"OI {oi:.0f}"
+    return True, ""
 
-    # स्टेप १: दोन्ही बाजूंचे 15 Delta (१०० च्या पटीत)
+
+def liquidity_issues(oc, legs):
+    out = []
+    for role in ("CE_S", "PE_S", "CE_H", "PE_H"):
+        lg = legs[role]
+        ok, why = leg_liquidity(oc, lg["strike"], lg["opt"])
+        if not ok:
+            out.append(f"{ROLE_NAME[role]} {lg['strike']}{lg['opt']}: {why}")
+    return out
+
+
+# ---------------- एंट्री (नियम २) ----------------
+def build_plan(oc, spot, T, bw, target_delta, hd):
+    """15Δ (किंवा 20Δ) + premium जुळवणी + hedge. (legs, None) किंवा (None, कारण)."""
     best = {"CE": None, "PE": None}
     for k in oc:
         if k % STRIKE_STEP:
@@ -604,45 +637,113 @@ def enter_trade(source):
             if ltp <= 0:
                 continue
             dl = leg_delta(leg, spot, k, T, opt)
-            gap = abs(dl - TARGET_DELTA)
+            gap = abs(dl - target_delta)
             if best[opt] is None or gap < best[opt][0]:
                 best[opt] = (gap, k, ltp, dl)
     if not best["CE"] or not best["PE"]:
-        log("15 Delta चे strikes सापडले नाहीत.")
-        return False
+        return None, f"{target_delta:.0f} Delta चे strikes सापडले नाहीत"
     ce_k, ce_ltp, pe_k, pe_ltp = best["CE"][1], best["CE"][2], best["PE"][1], best["PE"][2]
-    log(f"[{source}] Expiry {bw} | Spot {spot:.2f} | 15Δ → CE {ce_k} @{ce_ltp} (Δ{best['CE'][3]:.1f}) | "
-        f"PE {pe_k} @{pe_ltp} (Δ{best['PE'][3]:.1f})")
-
-    # स्टेप २: मोठा प्रिमियम base, दुसऱ्या बाजूला सर्वात जवळचा प्रिमियम
+    note = (f"{target_delta:.0f}Δ → CE {ce_k} @{ce_ltp} (Δ{best['CE'][3]:.1f}) | PE {pe_k} @{pe_ltp} (Δ{best['PE'][3]:.1f})")
     if ce_ltp >= pe_ltp:
-        base = ce_ltp
-        pe_k, pe_ltp = closest_premium(oc, base, "PE", lambda k: k < spot)
-        log(f"स्टेप २: CE base {base} → PE बाजूला जवळचा: {pe_k} @{pe_ltp}")
+        pe_k, pe_ltp = closest_premium(oc, ce_ltp, "PE", lambda k: k < spot)
     else:
-        base = pe_ltp
-        ce_k, ce_ltp = closest_premium(oc, base, "CE", lambda k: k > spot)
-        log(f"स्टेप २: PE base {base} → CE बाजूला जवळचा: {ce_k} @{ce_ltp}")
+        ce_k, ce_ltp = closest_premium(oc, pe_ltp, "CE", lambda k: k > spot)
     if not ce_k or not pe_k:
-        log("Matching strike सापडला नाही.")
-        return False
-
-    # स्टेप ३: 200 Points OTM Hedge
-    hd = int(CFG["HEDGE_DISTANCE"])
+        return None, "Matching strike सापडला नाही"
     plan = {"CE_S": (ce_k, "CE"), "PE_S": (pe_k, "PE"), "CE_H": (ce_k + hd, "CE"), "PE_H": (pe_k - hd, "PE")}
     legs = {}
     for role, (k, opt) in plan.items():
         ltp, _, _ = leg_info(oc, k, opt)
         sid = get_sid(oc, bw, k, opt)
         if ltp <= 0 or not sid:
-            log(f"{role} {k}{opt}: LTP किंवा SecurityID मिळाले नाही — एंट्री रद्द.")
-            return False
+            return None, f"{ROLE_NAME[role]} {k}{opt}: LTP किंवा SecurityID मिळाले नाही"
         legs[role] = {"strike": k, "opt": opt, "sec_id": sid, "ltp": ltp}
+    log(f"प्लॅन {target_delta:.0f}Δ/{hd}: {note} → Short {ce_k}CE @{legs['CE_S']['ltp']} / {pe_k}PE @{legs['PE_S']['ltp']}"
+        f" | Hedge {ce_k + hd}CE / {pe_k - hd}PE")
+    return legs, None
 
+
+def plan_lines(legs):
+    return (f"Short SELL: {legs['CE_S']['strike']} CE @{legs['CE_S']['ltp']} , {legs['PE_S']['strike']} PE @{legs['PE_S']['ltp']}\n"
+            f"Hedge BUY: {legs['CE_H']['strike']} CE @{legs['CE_H']['ltp']} , {legs['PE_H']['strike']} PE @{legs['PE_H']['ltp']}")
+
+
+_last_liq_alert = 0.0
+
+
+def enter_trade(source, use_fallback=False):
+    """True = ट्रेड घेतला, False = नाही, "ASKED" = 20Δ/100 चा पर्याय Telegram वर विचारला."""
+    mid, bw = get_expiries()
+    if not bw:
+        log("Expiry list मिळाली नाही — एंट्री नाही.")
+        return False
+    spot, oc = fetch_chain(bw)
+    if not spot:
+        return False
+    days = (datetime.strptime(bw, "%Y-%m-%d").date() - now().date()).days
+    T = max(days, 0.5) / 365.0
+    hd_std, d_fb, hd_fb = int(CFG["HEDGE_DISTANCE"]), float(CFG["FALLBACK_DELTA"]), int(CFG["FALLBACK_HEDGE"])
+
+    if use_fallback:
+        legs, err = build_plan(oc, spot, T, bw, d_fb, hd_fb)
+        if err:
+            alert(f"❌ {d_fb:.0f}Δ/{hd_fb} प्लॅन बनला नाही: {err}")
+            return False
+        bad = liquidity_issues(oc, legs)
+        if bad:
+            alert(f"❌ {d_fb:.0f}Δ/{hd_fb} सुद्धा आत्ता liquid नाही — एंट्री रद्द:\n" + "\n".join(bad))
+            return False
+        return place_entry(legs, bw, mid, f"{d_fb:.0f}Δ / {hd_fb} OTM (पर्याय)", hd_fb, source)
+
+    legs, err = build_plan(oc, spot, T, bw, TARGET_DELTA, hd_std)
+    if err:
+        log(f"[{source}] {err} — एंट्री नाही.")
+        return False
+    bad = liquidity_issues(oc, legs)
+    if not bad:
+        return place_entry(legs, bw, mid, f"{TARGET_DELTA:.0f}Δ / {hd_std} OTM", hd_std, source)
+
+    # 15Δ/200 liquid नाही → 20Δ/100 चा पर्याय विचारा
+    legs2, err2 = build_plan(oc, spot, T, bw, d_fb, hd_fb)
+    bad2 = liquidity_issues(oc, legs2) if legs2 else [err2]
+    head = f"⚠️ {TARGET_DELTA:.0f}Δ / {hd_std} OTM चे strikes liquid नाहीत ({source}):\n" + "\n".join(bad)
+    if bad2:
+        global _last_liq_alert
+        msg = head + f"\n\n{d_fb:.0f}Δ / {hd_fb} OTM सुद्धा liquid नाही:\n" + "\n".join(bad2) + "\n→ आत्ता एंट्री नाही (थोड्या वेळाने पुन्हा तपासेन)."
+        if time.time() - _last_liq_alert > 600:
+            _last_liq_alert = time.time()
+            alert(msg)
+        else:
+            log(msg.replace("\n", " | "))
+        return False
+    ttl = int(CFG["ENTRY_CONFIRM_MIN"]) * 60
+    state["entry_pending"] = {"source": source, "until": time.time() + ttl}
+    save_state()
+    ask_confirm("entry_fallback", {"source": source},
+                head + f"\n\nपर्याय: {d_fb:.0f}Δ + Hedge {hd_fb} OTM (Expiry {bw}, Spot {spot:.0f}):\n" + plan_lines(legs2) +
+                "\n(होकार दिल्यावर त्या क्षणाचे ताजे भाव घेऊन एंट्री होईल)", ttl)
+    return "ASKED"
+
+
+def decline_fallback(why):
+    ep = state.get("entry_pending") or {}
+    state["entry_pending"] = None
+    if "Re-entry" in str(ep.get("source", "")):
+        state["reentry_at"] = 0.0
+        nxt = "पुढच्या ट्रेडिंग दिवशी ९:३५ ला पुन्हा प्रयत्न."
+    else:
+        state["skip_entry_day"] = today_str()
+        nxt = "आज नवीन एंट्री नाही. पुढच्या ट्रेडिंग दिवशी ९:३५ ला पुन्हा प्रयत्न."
+    save_state()
+    alert(f"❎ 20Δ/100 पर्याय: {why} → {nxt}")
+
+
+def place_entry(legs, bw, mid, plan_name, hd, source):
     # नवीन ट्रेड नंबर (Sheet मधला Trade ID यावरून)
     state["trade_no"] += 1
     state.update({"legs": {}, "realized": 0.0, "shifts": 0, "expiry": bw, "rollover": mid,
-                  "imbalance": None, "extra_noted": [], "entry_time": now().strftime("%Y-%m-%d %H:%M:%S")})
+                  "imbalance": None, "extra_noted": [], "plan": plan_name, "hedge_dist": hd,
+                  "entry_time": now().strftime("%Y-%m-%d %H:%M:%S")})
     save_state()
 
     # ऑर्डर: आधी Hedge BUY, मग Short SELL
@@ -650,7 +751,7 @@ def enter_trade(source):
         lg = legs[role]
         ok, px = place(lg["sec_id"], side, lg["ltp"], f"ENTRY_{role}_{side}")
         if not ok:
-            sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, 0, None, _last_oid, "FAILED")
+            sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, 0, None, _last_oid, "FAILED", plan_name)
             close_legs(list(state["legs"].keys()), {}, typ="ENTRY-UNDO")
             state["in_trade"] = False
             save_state()
@@ -659,7 +760,7 @@ def enter_trade(source):
             return False
         state["legs"][role] = {**lg, "entry": px}
         save_state()
-        sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, px, None, _last_oid)
+        sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, px, None, _last_oid, note=plan_name)
         if role == "PE_H":
             time.sleep(0.5)
 
@@ -667,7 +768,7 @@ def enter_trade(source):
     save_state()
     sheet_trade("OPEN", 0.0, 0.0)
     L = state["legs"]
-    alert(f"🟢 नवीन ट्रेड {trade_id()} ({source}) | Expiry {bw} | Rollover {mid}\n"
+    alert(f"🟢 नवीन ट्रेड {trade_id()} ({source}) | प्लॅन: {plan_name}\nExpiry {bw} | Rollover {mid}\n"
           f"Hedge BUY: {L['CE_H']['strike']} CE @{L['CE_H']['entry']} , {L['PE_H']['strike']} PE @{L['PE_H']['entry']}\n"
           f"Short SELL: {L['CE_S']['strike']} CE @{L['CE_S']['entry']} , {L['PE_S']['strike']} PE @{L['PE_S']['entry']}\n"
           f"Qty {QTY} | Target +₹{target_amt():.0f} | SL -₹{sl_amt():.0f}")
@@ -1041,12 +1142,14 @@ def status_text():
     head = f"📊 {'PAPER' if PAPER else 'LIVE'} | {BOT_VERSION} {' '.join(flags)}"
     if not state["in_trade"]:
         nxt = "पुढचा ट्रेड: ९:३५ (ट्रेडिंग दिवशी)"
+        if state.get("entry_pending"):
+            nxt = "⏳ 20Δ/100 पर्यायासाठी तुमच्या /yes किंवा /no ची वाट पाहतोय"
         if state.get("reentry_at"):
             nxt = f"री-एंट्री: {datetime.fromtimestamp(state['reentry_at'], IST).strftime('%H:%M:%S')}"
         return f"{head}\nचालू ट्रेड नाही.\n{nxt}"
     L, ltp = state["legs"], LAST.get("ltp") or {}
     age = int(time.time() - LAST["time"]) if LAST["time"] else -1
-    lines = [head, f"{trade_id()} | Expiry {state['expiry']} | Rollover {state['rollover']} | शिफ्ट {state['shifts']}",
+    lines = [head, f"{trade_id()} | प्लॅन {state.get('plan') or '-'} | Expiry {state['expiry']} | Rollover {state['rollover']} | शिफ्ट {state['shifts']}",
              f"Spot {LAST['spot']:.2f} (भाव {age if age >= 0 else '?'} सेकंदांपूर्वीचा)"]
     for r in ("CE_S", "PE_S", "CE_H", "PE_H"):
         if r in L:
@@ -1117,6 +1220,8 @@ def settings_text():
     return (f"⚙️ {BOT_VERSION} | {'PAPER' if PAPER else 'LIVE'}\nLots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY}\n"
             f"Capital ₹{CFG['DEPLOYED_CAPITAL']} | Target {CFG['PROFIT_TARGET_PCT']}% | SL {CFG['MAX_SL_PCT']}%\n"
             f"Hedge {CFG['HEDGE_DISTANCE']} pts | री-एंट्री {CFG['REENTRY_WAIT_MIN']} मि. | Balance वेळ {BALANCE_WAIT_MIN} मि.\n"
+            f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | पर्याय {CFG['FALLBACK_DELTA']:.0f}Δ / {CFG['FALLBACK_HEDGE']} OTM\n"
+            f"दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'}\n"
             f"Gap निरीक्षण ९:१५-९:१७ | TOTP: {'✅' if totp_enabled() else '❌'} | Sheet: {'✅' if CFG.get('SHEET_WEBHOOK_URL') else '❌'}")
 
 
@@ -1129,10 +1234,11 @@ def log_text():
         return f"log वाचता आला नाही: {e}"
 
 
-def ask_confirm(kind, data, plan_txt):
+def ask_confirm(kind, data, plan_txt, ttl=CONFIRM_SEC):
     PENDING.clear()
-    PENDING.update({"kind": kind, "data": data, "expires": time.time() + CONFIRM_SEC})
-    tg(f"📋 प्लॅन ({trade_id() if state['in_trade'] else '-'}):\n{plan_txt}\n\nपक्कं करायला {CONFIRM_SEC} सेकंदांत /yes पाठवा (रद्द: /no)")
+    PENDING.update({"kind": kind, "data": data, "expires": time.time() + ttl})
+    wait = f"{ttl // 60} मिनिटांत" if ttl >= 120 else f"{ttl} सेकंदांत"
+    tg(f"📋 प्लॅन ({trade_id() if state['in_trade'] else '-'}):\n{plan_txt}\n\nपक्कं करायला {wait} /yes पाठवा (रद्द: /no)")
 
 
 def plan_adjust(side=None, strike=None):
@@ -1221,14 +1327,28 @@ def handle_command(cid, txt, name):
         PENDING.clear()
         run_pending(p)
     elif cmd == "/no":
+        kind = PENDING.get("kind")
         PENDING.clear()
-        tg("❎ प्लॅन रद्द केला.")
+        if kind == "entry_fallback" or state.get("entry_pending"):
+            decline_fallback("तुम्ही नकार दिला")
+        else:
+            tg("❎ प्लॅन रद्द केला.")
     else:
         tg("हा command समजला नाही. /help पाठवा.")
 
 
 def run_pending(p):
     kind, d = p["kind"], p["data"]
+    if kind == "entry_fallback":
+        state["entry_pending"] = None
+        save_state()
+        n = now()
+        if state["in_trade"] or not market_open(n) or hm(n) >= LAST_NEW_ENTRY:
+            return tg("आता एंट्रीची वेळ/स्थिती नाही — रद्द.")
+        tg("👍 होकार मिळाला — 20Δ/100 प्लॅनने ताज्या भावात एंट्री करत आहे...")
+        if not enter_trade(d.get("source", "") + " + 20Δ/100 पर्याय", use_fallback=True):
+            decline_fallback("एंट्री होऊ शकली नाही")
+        return
     if kind == "exit":
         state["paused"] = True
         save_state()
@@ -1372,24 +1492,38 @@ def main():
                 continue
 
             t = today_str()
+            hk = n.strftime("%Y-%m-%d %H")
+            if CFG["HOURLY_STATUS"] and n.minute == 0 and 10 <= n.hour <= 15 and state.get("last_hourly") != hk:
+                state["last_hourly"] = hk
+                save_state()
+                tg(f"🕐 {n.strftime('%H:%M')} तासाचा रिपोर्ट\n" + status_text())
+
+            ep = state.get("entry_pending")
+            if ep and time.time() > float(ep.get("until", 0)):
+                if PENDING.get("kind") == "entry_fallback":
+                    PENDING.clear()
+                decline_fallback(f"{CFG['ENTRY_CONFIRM_MIN']} मिनिटांत उत्तर आलं नाही")
             # एक्झिट नियम ५.१: मधल्या expiry दिवशी ९:३० (किंवा ती तारीख उलटून गेली असेल तर लगेच)
             if state["in_trade"] and state.get("rollover") and (
                     t > state["rollover"] or (t == state["rollover"] and hm(n) >= ROLLOVER_EXIT_TIME)):
                 full_exit("Rollover Time Exit (नियम ५.१)", False, None, imbalance_qtys())
 
-            if not state["in_trade"]:
+            if not state["in_trade"] and state.get("entry_pending"):
+                pass                                  # 20Δ/100 पर्यायासाठी तुमच्या उत्तराची वाट
+            elif not state["in_trade"]:
                 ra = float(state.get("reentry_at") or 0)
                 if ra > 0:
                     if time.time() >= ra and hm(n) < LAST_NEW_ENTRY and not state["paused"]:
                         state["reentry_at"] = 0.0
                         save_state()
-                        if not enter_trade("Re-entry (नियम ६)") and not state["halted"]:
+                        r = enter_trade("Re-entry (नियम ६)")
+                        if r is False and not state["halted"]:
                             state["reentry_at"] = time.time() + 60
                             save_state()
-                elif ENTRY_TIME <= hm(n) < ENTRY_WINDOW_END and not state["paused"]:
+                elif ENTRY_TIME <= hm(n) < ENTRY_WINDOW_END and not state["paused"] and state.get("skip_entry_day") != t:
                     enter_trade("९:३५ एंट्री")
                 elif ENTRY_WINDOW_END <= hm(n) < (9, 45) and state.get("no_entry_alert_day") != t \
-                        and not state["paused"]:
+                        and not state["paused"] and state.get("skip_entry_day") != t:
                     state["no_entry_alert_day"] = t
                     save_state()
                     alert("ℹ️ आज ९:३५-९:४० मध्ये ट्रेड घेतला गेला नाही (/log पाहा).")

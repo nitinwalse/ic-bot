@@ -18,6 +18,15 @@ MAX_SL_PCT = 1.25          # एकूण तोटा या % ला पोह
 HEDGE_DISTANCE = 200       # Short strike पासून Hedge किती points बाहेर
 REENTRY_WAIT_MIN = 5       # Target/SL/Strike-limit नंतर किती मिनिटांनी री-एंट्री
 
+# ---- Liquidity पर्याय (V1.2) — या ओळी नसल्या तरी हेच मूल्य वापरले जाते ----
+FALLBACK_DELTA = 20        # 15Δ/200 liquid नसेल तर Telegram वर विचारायचा पर्याय: हा Delta
+FALLBACK_HEDGE = 100       # ... आणि हा Hedge अंतर
+LIQ_MAX_SPREAD_PCT = 5.0   # bid-ask spread LTP च्या या % पेक्षा जास्त = illiquid
+LIQ_MIN_SPREAD_RS = 1.0    # पण ₹1 पर्यंतचा spread नेहमी चालेल
+LIQ_MIN_OI = 0             # किमान OI (आत्ता बंद — Paper नंतर ठरवू)
+ENTRY_CONFIRM_MIN = 10     # पर्यायाला /yes देण्यासाठी किती मिनिटं
+HOURLY_STATUS = True       # दर तासाला (१०:०० ते ३:००) Telegram वर status
+
 # NSE सुट्ट्या (YYYY-MM-DD) — NSE च्या वेबसाईटवर तपासून यादी पूर्ण करा
 HOLIDAYS = ["2026-11-24", "2026-12-25"]
 
