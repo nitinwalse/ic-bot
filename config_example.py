@@ -1,4 +1,4 @@
-# ================= Nitin IC Bot V3.0 — config.py =================
+# ================= Nitin IC Bot V3.1 — config.py =================
 # फक्त या file मध्ये बदल करायचे. bot.py ला हात लावायचा नाही.
 # Token/Telegram/Sheet बदलले तर बॉट आपोआप घेतो. लॉट Telegram वर /lots 12 ने बदला.
 # बाकी कोणताही बदल केला तर:  sudo systemctl restart icbot
@@ -29,7 +29,8 @@ EOD_CHECK_HHMM = 1510      # १५:१०
 REENTRY_COOL_MIN = 15      # एक्झिटनंतर cooling (सकाळी ९:३५ / ३:१० नंतर ३:१४ हे अपवाद)
 
 # ---- Liquidity ----
-FALLBACK_DELTA = 20        # 15Δ liquid नसेल तर आपोआप हा Delta (फक्त Telegram वर माहिती)
+DELTA_MAX = 25             # Delta शिडी: 15Δ पासून इथपर्यंत (base strike ५० च्या पटीत / illiquid असेल तर पुढचा)
+FALLBACK_DELTA = 20        # (V3.1 पासून वापरात नाही)
 LIQ_MAX_SPREAD_PCT = 5.0   # bid-ask spread LTP च्या या % पेक्षा जास्त = illiquid
 LIQ_MIN_SPREAD_RS = 1.0    # पण ₹1 पर्यंतचा spread नेहमी चालेल
 LIQ_MIN_OI = 0

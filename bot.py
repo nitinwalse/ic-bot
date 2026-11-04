@@ -2,7 +2,8 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V3.0  (04-11-2026)  — अंतिम नियमावली V3.0
+ Version : V3.1  (04-11-2026)  — अंतिम नियमावली V3.1
+   + Delta शिडी: 15Δ चा base strike 50 च्या पटीत / illiquid असेल तर 16, 17 ... 25Δ (दोन्ही बाजू एकाच Delta ने)
    + Sell: 15Δ पैकी कमी premium base | Hedge: Short ± 100 OTM, पुढच्या expiry मध्ये
    + Target ₹1,100/लॉट, SL ₹1,800/लॉट | ९:१५-९:१७ no-action, ९:१८ पासून निर्णय
    + 2x (९:१८-३:०९), ३:१० पासून 1.65x (कितीही वेळा) | ITM/Overlap/Straddle → एक्झिट
@@ -29,7 +30,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V3.0"
+BOT_VERSION = "V3.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -68,7 +69,7 @@ NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT":
             "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True,
             "USE_STOPLOSS": False, "LOSS_ALERT_STEP_PCT": 1.25, "TARGET_REENTRY_SEC": 15,
             "EOD_RATIO": 1.65, "EOD_CHECK_HHMM": 1510, "TARGET_PER_LOT": 1100.0, "SL_PER_LOT": 1800.0,
-            "REENTRY_COOL_MIN": 15, "MAX_LOTS": 27,
+            "REENTRY_COOL_MIN": 15, "MAX_LOTS": 27, "DELTA_MAX": 25,
             "HEDGE_PREM_ADD_MIN": 10.0, "HEDGE_PREM_ADD_MAX": 20.0, "HEDGE_PREM_ADD_TARGET": 15.0,
             "HEDGE_FALLBACK_OTM": 100}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
@@ -738,9 +739,7 @@ def build_plan(oc_s, oc_h, spot, T, se, he, target_delta):
     """Short: se expiry मध्ये target_delta + premium जुळवणी. Hedge: he expiry मध्ये +10..20 किंवा ±100.
     (legs, hedge_method, None) किंवा (None, None, कारण)."""
     best = {"CE": None, "PE": None}
-    for k in oc_s:
-        if k % STRIKE_STEP:
-            continue
+    for k in oc_s:                       # सगळे strikes (५० चे सुद्धा) — Delta जवळचा शोधण्यासाठी
         for opt in ("CE", "PE"):
             if (opt == "CE" and k <= spot) or (opt == "PE" and k >= spot):
                 continue
@@ -755,7 +754,10 @@ def build_plan(oc_s, oc_h, spot, T, se, he, target_delta):
         return None, None, f"{target_delta:.0f} Delta चे strikes सापडले नाहीत"
     ce_k, ce_ltp, pe_k, pe_ltp = best["CE"][1], best["CE"][2], best["PE"][1], best["PE"][2]
     note = f"{target_delta:.0f}Δ → CE {ce_k} @{ce_ltp} (Δ{best['CE'][3]:.1f}) | PE {pe_k} @{pe_ltp} (Δ{best['PE'][3]:.1f})"
-    # V3.0: कमी premium ची बाजू base
+    # V3.0: कमी premium ची बाजू base — आणि base strike १०० च्या पटीतच हवा (नाहीतर पुढचा Delta)
+    base_k = ce_k if ce_ltp <= pe_ltp else pe_k
+    if base_k % STRIKE_STEP:
+        return None, None, f"{target_delta:.0f}Δ चा base strike {base_k} हा ५० च्या पटीत ({note})"
     if ce_ltp <= pe_ltp:
         pe_k, pe_ltp = closest_premium(oc_s, ce_ltp, "PE", lambda k: k < spot)
     else:
@@ -793,11 +795,12 @@ _last_liq_alert = 0.0
 
 
 def enter_trade(source, use_fallback=False):
-    """True = ट्रेड घेतला, False = नाही, "ASKED" = 20Δ चा पर्याय Telegram वर विचारला."""
+    """Delta शिडी: 15Δ पासून 25Δ पर्यंत, दोन्ही बाजू एकाच Delta ने.
+    base strike (कमी premium) ५० च्या पटीत असेल किंवा कोणताही leg illiquid असेल तर पुढचा Delta."""
     global _last_liq_alert
     mid, se, he = get_expiries()
     if not he:
-        log("Expiry list (३ expiry) मिळाली नाही — एंट्री नाही.")
+        log("Expiry list (४ expiry) मिळाली नाही — एंट्री नाही.")
         return False
     spot, oc_s = get_chain(se, 0)
     if not spot:
@@ -808,41 +811,30 @@ def enter_trade(source, use_fallback=False):
     ocmap = {se: oc_s, he: oc_h}
     days = (datetime.strptime(se, "%Y-%m-%d").date() - now().date()).days
     T = max(days, 0.5) / 365.0
-    d_fb = float(CFG["FALLBACK_DELTA"])
-
-    if use_fallback:
-        legs, method, err = build_plan(oc_s, oc_h, spot, T, se, he, d_fb)
+    d_start, d_max = int(TARGET_DELTA), int(CFG["DELTA_MAX"])
+    skipped = []
+    for d in range(d_start, d_max + 1):
+        legs, method, err = build_plan(oc_s, oc_h, spot, T, se, he, float(d))
         if err:
-            alert(f"❌ {d_fb:.0f}Δ प्लॅन बनला नाही: {err}")
-            return False
+            skipped.append(f"• {d}Δ: {err.split(' (')[0]}")
+            continue
         bad = liquidity_issues(ocmap, legs)
         if bad:
-            alert(f"❌ {d_fb:.0f}Δ सुद्धा आत्ता liquid नाही — एंट्री रद्द:\n" + "\n".join(bad))
-            return False
-        return place_entry(legs, se, mid, he, f"{d_fb:.0f}Δ | {method} (पर्याय)", source)
-
-    legs, method, err = build_plan(oc_s, oc_h, spot, T, se, he, TARGET_DELTA)
-    if err:
-        log(f"[{source}] {err} — एंट्री नाही.")
-        return False
-    bad = liquidity_issues(ocmap, legs)
-    if not bad:
-        return place_entry(legs, se, mid, he, f"{TARGET_DELTA:.0f}Δ | {method}", source)
-
-    legs2, method2, err2 = build_plan(oc_s, oc_h, spot, T, se, he, d_fb)
-    bad2 = liquidity_issues(ocmap, legs2) if legs2 else [err2]
-    head = (f"ℹ️ Liquidity कारण ({source}): {TARGET_DELTA:.0f}Δ चे strikes पुरेसे liquid नाहीत —\n" + "\n".join(bad) +
-            "\n(म्हणजे खरेदी-विक्रीच्या भावात मोठी तफावत किंवा खरेदीदार/विक्रेता नाही; अशा strike वर market order महाग पडते)")
-    if bad2:
-        msg = head + f"\n\n{d_fb:.0f}Δ सुद्धा liquid नाही:\n" + "\n".join(bad2) + "\n→ आत्ता एंट्री नाही (थोड्या वेळाने पुन्हा तपासेन)."
-        if time.time() - _last_liq_alert > 600:
-            _last_liq_alert = time.time()
-            alert(msg)
-        else:
-            log(msg.replace("\n", " | "))
-        return False
-    alert(head + f"\n→ म्हणून आपोआप {d_fb:.0f}Δ (ATM च्या थोडं जवळ, जास्त liquid) strikes ने एंट्री करत आहे.")
-    return place_entry(legs2, se, mid, he, f"{d_fb:.0f}Δ | {method2} (Liquidity मुळे)", source)
+            skipped.append(f"• {d}Δ: liquid नाही — " + "; ".join(bad))
+            continue
+        name = f"{d}Δ | {method}"
+        if skipped:
+            alert(f"ℹ️ Delta शिडी ({source}): 15Δ ऐवजी {d}Δ ने एंट्री. कारण:\n" + "\n".join(skipped) +
+                  "\n(५० च्या पटीतला strike आपण घेत नाही; illiquid म्हणजे bid-ask मध्ये मोठी तफावत, जिथे market order महाग पडते)")
+        return place_entry(legs, se, mid, he, name, source)
+    msg = (f"⚠️ {d_start}Δ ते {d_max}Δ पर्यंत एकही योग्य (१०० च्या पटीतला + liquid) प्लॅन मिळाला नाही ({source}):\n" +
+           "\n".join(skipped[-6:]) + "\n→ आत्ता एंट्री नाही (थोड्या वेळाने पुन्हा तपासेन).")
+    if time.time() - _last_liq_alert > 600:
+        _last_liq_alert = time.time()
+        alert(msg)
+    else:
+        log(msg.replace("\n", " | "))
+    return False
 
 
 def decline_fallback(why):
@@ -1501,7 +1493,7 @@ def settings_text():
             f"Sell: दुसरी expiry, 15Δ पैकी कमी premium base | Hedge: पुढची expiry, Short ± {CFG['HEDGE_FALLBACK_OTM']} OTM\n"
             f"ॲडजस्टमेंट: 2x (९:१८-३:०९), 1.65x (३:१० पासून, कितीही वेळा) | ITM/Overlap/Straddle → एक्झिट\n"
             f"री-एंट्री: {CFG['REENTRY_COOL_MIN']} मि. cooling | सकाळी (९:१८-९:३४) → ९:३५ | ३:१० नंतर → ३:१४ | ३:२५ नंतर नाही\n"
-            f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | नसेल तर आपोआप {CFG['FALLBACK_DELTA']:.0f}Δ\n"
+            f"Delta शिडी: 15Δ → {CFG['DELTA_MAX']}Δ (base strike ५० च्या पटीत / illiquid असेल तर पुढचा) | spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']})\n"
             f"No-action ९:१५-९:१७ | दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'} | TOTP: {'✅' if totp_enabled() else '❌'} | Sheet: {'✅' if CFG.get('SHEET_WEBHOOK_URL') else '❌'}")
 
 
