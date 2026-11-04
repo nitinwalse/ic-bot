@@ -2,19 +2,12 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V1.6  (04-11-2026)
-   + NSE सुट्ट्यांची यादी कोडमध्येच (१० नोव्हें. बलिप्रतिपदा, २४ नोव्हें., २५ डिसें.)
-   + ३:१० ची दिवसअखेर तपासणी: Short premium फरक ≥ 1.65x असेल तर आजच ॲडजस्टमेंट
-   + Target बुक झाल्यावर १५ सेकंदांनी नवीन एंट्री (TARGET_REENTRY_SEC)
-   + Stop-loss बंद (USE_STOPLOSS = False): फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट
-   + तोट्याचे इशारे (फक्त माहिती) + Hedge-आधारित कमाल धोका /status मध्ये
-   + Liquidity तपासणी: 15Δ/200 liquid नसेल तर 20Δ/100 चा पर्याय Telegram वर (/yes ने एंट्री)
-   + दर तासाला ट्रेड status Telegram वर
-   + Telegram रिपोर्ट आणि commands (/status /exit /adjust ...)
-   + Google Sheet नोंदी (Orders + Trades, Trade ID)
-   + Broker Match (तुमची qty वेगळी, १५ मिनिटांचा balancing नियम)
-   + Gap नियम: ९:१५-९:१७ फक्त निरीक्षण
-   + TOTP auto token (startup दुरुस्तीसह)
+ Version : V3.0  (04-11-2026)  — अंतिम नियमावली V3.0
+   + Sell: 15Δ पैकी कमी premium base | Hedge: Short ± 100 OTM, पुढच्या expiry मध्ये
+   + Target ₹1,100/लॉट, SL ₹1,800/लॉट | ९:१५-९:१७ no-action, ९:१८ पासून निर्णय
+   + 2x (९:१८-३:०९), ३:१० पासून 1.65x (कितीही वेळा) | ITM/Overlap/Straddle → एक्झिट
+   + री-एंट्री: १५ मिनिटं cooling (सकाळी ९:३५, ३:१० नंतर ३:१४) | Rollover च्या आदल्या दिवशी पुढची सायकल
+   + Liquidity: 20Δ आपोआप (फक्त माहिती) | /lots ने लॉट बदल | जुने ट्रेड बंद करून नवीन सुरुवात
  Broker  : Dhan (dhanhq 2.3.x)   |   Server: AWS EC2 (Ubuntu)
 ---------------------------------------------------------------------
  या file ला हात लावायचा नाही. सर्व बदल config.py मध्येच.
@@ -36,7 +29,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V1.6"
+BOT_VERSION = "V3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -51,10 +44,12 @@ TARGET_DELTA = 15.0
 ENTRY_TIME = (9, 35)          # नवीन ट्रेड
 ENTRY_WINDOW_END = (9, 40)    # ९:३५ ची एंट्री फेल झाली तर ९:४० पर्यंत पुन्हा प्रयत्न
 ROLLOVER_EXIT_TIME = (9, 30)  # मधल्या expiry दिवशी पूर्ण एक्झिट
-GAP_WATCH_END = (9, 17)       # ९:१५-९:१७ फक्त निरीक्षण (SL/TP/2x निर्णय नाहीत)
+GAP_WATCH_END = (9, 18)       # ९:१५-९:१७ no-action, ९:१८ पासून निर्णय
+MORNING_REENTRY_END = (9, 35)  # ९:१८-९:३४ मध्ये एक्झिट झाली तर री-एंट्री ९:३५ ला
+EOD_REENTRY = (15, 14)        # ३:१० नंतर एक्झिट झाली तर री-एंट्री ३:१४ ला
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
-LAST_NEW_ENTRY = (15, 15)     # यानंतर नवीन ट्रेड/री-एंट्री नाही
+LAST_NEW_ENTRY = (15, 26)     # ३:२५ नंतर नवीन ट्रेड/री-एंट्री नाही
 DAILY_SUMMARY_TIME = (15, 31)
 CHAIN_MIN_GAP = 3.2           # Dhan option chain: ३ सेकंदात १ request
 LOOP_SLEEP = 0.5
@@ -72,7 +67,10 @@ OPTIONAL_KEYS = {"HOLIDAYS": [], "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "
 NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT": 5.0,
             "LIQ_MIN_SPREAD_RS": 1.0, "LIQ_MIN_OI": 0, "ENTRY_CONFIRM_MIN": 10, "HOURLY_STATUS": True,
             "USE_STOPLOSS": False, "LOSS_ALERT_STEP_PCT": 1.25, "TARGET_REENTRY_SEC": 15,
-            "EOD_RATIO": 1.65, "EOD_CHECK_HHMM": 1510}
+            "EOD_RATIO": 1.65, "EOD_CHECK_HHMM": 1510, "TARGET_PER_LOT": 1100.0, "SL_PER_LOT": 1800.0,
+            "REENTRY_COOL_MIN": 15, "MAX_LOTS": 27,
+            "HEDGE_PREM_ADD_MIN": 10.0, "HEDGE_PREM_ADD_MAX": 20.0, "HEDGE_PREM_ADD_TARGET": 15.0,
+            "HEDGE_FALLBACK_OTM": 100}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
 
 # ---------------- Logging (IST वेळेत) ----------------
@@ -248,6 +246,21 @@ def save_token_to_config(tok):
     CFG_MTIME = os.path.getmtime(CONFIG_FILE)
 
 
+def save_config_value(key, value):
+    """config.py मधली एखादी ओळ बदलणे (उदा. LOTS). restart नंतरही तेच राहते."""
+    global CFG_MTIME
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        txt = f.read()
+    line = f"{key} = {value}"
+    if re.search(rf"^{key}\s*=.*$", txt, flags=re.M):
+        txt = re.sub(rf"^{key}\s*=[^#\n]*", lambda m: line + "  ", txt, count=1, flags=re.M)
+    else:
+        txt += f"\n{line}\n"
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.write(txt)
+    CFG_MTIME = os.path.getmtime(CONFIG_FILE)
+
+
 def refresh_token(reason):
     """PIN + TOTP ने Dhan कडून नवीन Access Token. यश मिळालं तर True."""
     global _last_token_try, _token_day
@@ -286,7 +299,8 @@ def blank_state():
             "reentry_at": 0.0, "entry_time": None, "no_entry_alert_day": None,
             "imbalance": None, "extra_noted": [], "summary_day": None,
             "entry_pending": None, "skip_entry_day": None, "last_hourly": None,
-            "plan": "", "hedge_dist": 0, "eod_check_day": None, "loss_alert_level": 0}
+            "plan": "", "hedge_dist": 0, "hedge_expiry": None, "eod_check_day": None, "loss_alert_level": 0,
+            "version": "V3", "qty": 0, "pending_lots": None}
 
 
 state = blank_state()
@@ -299,8 +313,11 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 s = json.load(f)
             base = blank_state()
+            old = "version" not in s
             base.update(s)
             state = base
+            if old and state.get("in_trade"):
+                state["force_exit_old"] = True    # V3.0 आधीचा ट्रेड → बंद करून नवीन सुरुवात
             return
         except Exception as e:
             log(f"State file वाचता आली नाही ({e}) — नवीन सुरुवात.")
@@ -338,7 +355,11 @@ def sheet_order(typ, role, strike, opt, side, qty, price, booked=None, oid="", s
 
 def leg_txt(role):
     lg = state["legs"].get(role)
-    return f"{lg['strike']} @{lg['entry']:.2f}" if lg else "-"
+    if not lg:
+        return "-"
+    e = lg.get("expiry")
+    tag = f" ({e[8:10]}-{e[5:7]})" if e and e != state.get("expiry") else ""
+    return f"{lg['strike']}{tag} @{lg['entry']:.2f}"
 
 
 def sheet_trade(status="OPEN", unbooked=None, net=None, exit_reason=""):
@@ -389,16 +410,59 @@ def unwrap(res, what=""):
 
 # ---------------- Expiry आणि Option Chain ----------------
 def get_expiries():
-    """valid[0] = मधली expiry (Rollover दिवस), valid[1] = Bi-weekly trading expiry."""
+    """valid[0] = मधली expiry (Rollover दिवस), valid[1] = Short ची expiry, valid[2] = Hedge ची expiry."""
     d = unwrap(dhan.expiry_list(under_security_id=UNDERLYING_ID,
                                 under_exchange_segment=UNDERLYING_SEG), "Expiry list")
     if not isinstance(d, list):
-        return None, None
+        return None, None, None
     t = today_str()
     valid = sorted(e for e in d if isinstance(e, str) and e > t)
-    if len(valid) < 2:
-        return None, None
-    return valid[0], valid[1]
+    if len(valid) < 4:
+        return None, None, None
+    # नियम: Rollover expiry च्या आदल्या ट्रेडिंग दिवशी एंट्री झाली तर ती सायकल सोडून पुढची
+    # (उदा. ६ तारखेला: ७ ची Rollover सोडून → Sell २१, Hedge २८, Rollover १४)
+    if next_trading_day() == valid[0]:
+        return valid[1], valid[2], valid[3]
+    return valid[0], valid[1], valid[2]
+
+
+def next_trading_day():
+    from datetime import timedelta
+    d = now()
+    for _ in range(10):
+        d = d + timedelta(days=1)
+        if is_trading_day(d):
+            return d.strftime("%Y-%m-%d")
+    return None
+
+
+def hedge_expiry():
+    """चालू ट्रेडची Hedge expiry. जुन्या ट्रेडमध्ये नसेल तर Short expiry नंतरची पहिली."""
+    if state.get("hedge_expiry"):
+        return state["hedge_expiry"]
+    d = unwrap(dhan.expiry_list(under_security_id=UNDERLYING_ID,
+                                under_exchange_segment=UNDERLYING_SEG), "Expiry list")
+    if isinstance(d, list) and state.get("expiry"):
+        later = sorted(e for e in d if isinstance(e, str) and e > state["expiry"])
+        if later:
+            state["hedge_expiry"] = later[0]
+            save_state()
+            return later[0]
+    return None
+
+
+_chain_cache = {}
+
+
+def get_chain(expiry, max_age=0.0):
+    """expiry ची option chain. max_age सेकंदांपेक्षा जुनी नसेल तर साठवलेली वापरतो."""
+    c = _chain_cache.get(expiry)
+    if c and time.time() - c[0] <= max_age:
+        return c[1], c[2]
+    spot, oc = fetch_chain(expiry)
+    if spot:
+        _chain_cache[expiry] = (time.time(), spot, oc)
+    return spot, oc
 
 
 _last_chain = 0.0
@@ -625,27 +689,62 @@ def leg_liquidity(oc, strike, opt):
     return True, ""
 
 
-def liquidity_issues(oc, legs):
+def liquidity_issues(ocmap, legs):
     out = []
     for role in ("CE_S", "PE_S", "CE_H", "PE_H"):
         lg = legs[role]
-        ok, why = leg_liquidity(oc, lg["strike"], lg["opt"])
+        ok, why = leg_liquidity(ocmap[lg["expiry"]], lg["strike"], lg["opt"])
         if not ok:
             out.append(f"{ROLE_NAME[role]} {lg['strike']}{lg['opt']}: {why}")
     return out
 
 
-# ---------------- एंट्री (नियम २) ----------------
-def build_plan(oc, spot, T, bw, target_delta, hd):
-    """15Δ (किंवा 20Δ) + premium जुळवणी + hedge. (legs, None) किंवा (None, कारण)."""
+# ---------------- एंट्री (नियम २, V2.0 रचना) ----------------
+def pick_hedge(oc_h, he, short_k, short_prem, opt, spot):
+    """Hedge expiry मध्ये premium (Short + 10 ते 20) असलेला, १०० च्या पटीतला strike. लक्ष्य +15.
+    (strike, ltp, sid) किंवा None."""
+    lo = short_prem + float(CFG["HEDGE_PREM_ADD_MIN"])
+    hi = short_prem + float(CFG["HEDGE_PREM_ADD_MAX"])
+    tgt = short_prem + float(CFG["HEDGE_PREM_ADD_TARGET"])
+    best = None
+    for k in sorted(oc_h):
+        if k % STRIKE_STEP:
+            continue
+        if (opt == "CE" and k <= spot) or (opt == "PE" and k >= spot):
+            continue
+        ltp, _, _ = leg_info(oc_h, k, opt)
+        if ltp <= 0 or ltp < lo - 1e-9 or ltp > hi + 1e-9:
+            continue
+        diff = abs(ltp - tgt)
+        far = k if opt == "CE" else -k
+        if best is None or diff < best[0] - 1e-9 or (abs(diff - best[0]) < 1e-9 and far > best[2]):
+            best = (diff, k, far, ltp)
+    if not best:
+        return None
+    sid = get_sid(oc_h, he, best[1], opt)
+    return (best[1], best[3], sid) if sid else None
+
+
+def fallback_hedge(oc_h, he, short_k, opt):
+    """Short strike पासून HEDGE_FALLBACK_OTM (100) points OTM, Hedge expiry मध्ये."""
+    off = int(CFG["HEDGE_FALLBACK_OTM"])
+    k = short_k + off if opt == "CE" else short_k - off
+    ltp, _, _ = leg_info(oc_h, k, opt)
+    sid = get_sid(oc_h, he, k, opt)
+    return (k, ltp, sid) if ltp > 0 and sid else None
+
+
+def build_plan(oc_s, oc_h, spot, T, se, he, target_delta):
+    """Short: se expiry मध्ये target_delta + premium जुळवणी. Hedge: he expiry मध्ये +10..20 किंवा ±100.
+    (legs, hedge_method, None) किंवा (None, None, कारण)."""
     best = {"CE": None, "PE": None}
-    for k in oc:
+    for k in oc_s:
         if k % STRIKE_STEP:
             continue
         for opt in ("CE", "PE"):
             if (opt == "CE" and k <= spot) or (opt == "PE" and k >= spot):
                 continue
-            ltp, _, leg = leg_info(oc, k, opt)
+            ltp, _, leg = leg_info(oc_s, k, opt)
             if ltp <= 0:
                 continue
             dl = leg_delta(leg, spot, k, T, opt)
@@ -653,88 +752,97 @@ def build_plan(oc, spot, T, bw, target_delta, hd):
             if best[opt] is None or gap < best[opt][0]:
                 best[opt] = (gap, k, ltp, dl)
     if not best["CE"] or not best["PE"]:
-        return None, f"{target_delta:.0f} Delta चे strikes सापडले नाहीत"
+        return None, None, f"{target_delta:.0f} Delta चे strikes सापडले नाहीत"
     ce_k, ce_ltp, pe_k, pe_ltp = best["CE"][1], best["CE"][2], best["PE"][1], best["PE"][2]
-    note = (f"{target_delta:.0f}Δ → CE {ce_k} @{ce_ltp} (Δ{best['CE'][3]:.1f}) | PE {pe_k} @{pe_ltp} (Δ{best['PE'][3]:.1f})")
-    if ce_ltp >= pe_ltp:
-        pe_k, pe_ltp = closest_premium(oc, ce_ltp, "PE", lambda k: k < spot)
+    note = f"{target_delta:.0f}Δ → CE {ce_k} @{ce_ltp} (Δ{best['CE'][3]:.1f}) | PE {pe_k} @{pe_ltp} (Δ{best['PE'][3]:.1f})"
+    # V3.0: कमी premium ची बाजू base
+    if ce_ltp <= pe_ltp:
+        pe_k, pe_ltp = closest_premium(oc_s, ce_ltp, "PE", lambda k: k < spot)
     else:
-        ce_k, ce_ltp = closest_premium(oc, pe_ltp, "CE", lambda k: k > spot)
+        ce_k, ce_ltp = closest_premium(oc_s, pe_ltp, "CE", lambda k: k > spot)
     if not ce_k or not pe_k:
-        return None, "Matching strike सापडला नाही"
-    plan = {"CE_S": (ce_k, "CE"), "PE_S": (pe_k, "PE"), "CE_H": (ce_k + hd, "CE"), "PE_H": (pe_k - hd, "PE")}
+        return None, None, "Matching strike सापडला नाही"
     legs = {}
-    for role, (k, opt) in plan.items():
-        ltp, _, _ = leg_info(oc, k, opt)
-        sid = get_sid(oc, bw, k, opt)
+    for role, k, opt in (("CE_S", ce_k, "CE"), ("PE_S", pe_k, "PE")):
+        ltp, _, _ = leg_info(oc_s, k, opt)
+        sid = get_sid(oc_s, se, k, opt)
         if ltp <= 0 or not sid:
-            return None, f"{ROLE_NAME[role]} {k}{opt}: LTP किंवा SecurityID मिळाले नाही"
-        legs[role] = {"strike": k, "opt": opt, "sec_id": sid, "ltp": ltp}
-    log(f"प्लॅन {target_delta:.0f}Δ/{hd}: {note} → Short {ce_k}CE @{legs['CE_S']['ltp']} / {pe_k}PE @{legs['PE_S']['ltp']}"
-        f" | Hedge {ce_k + hd}CE / {pe_k - hd}PE")
-    return legs, None
+            return None, None, f"{ROLE_NAME[role]} {k}{opt}: LTP किंवा SecurityID मिळाले नाही"
+        legs[role] = {"strike": k, "opt": opt, "sec_id": sid, "ltp": ltp, "expiry": se}
+    # Hedge: दोन्ही बाजूंना premium-range मिळाला तरच; नाहीतर दोन्ही ±100 OTM
+    hc = fallback_hedge(oc_h, he, ce_k, "CE")
+    hp = fallback_hedge(oc_h, he, pe_k, "PE")
+    method = f"Hedge ±{CFG['HEDGE_FALLBACK_OTM']} OTM"
+    if not (hc and hp):
+        return None, None, f"Hedge ({he}) {ce_k + int(CFG['HEDGE_FALLBACK_OTM'])}CE / {pe_k - int(CFG['HEDGE_FALLBACK_OTM'])}PE चे भाव मिळाले नाहीत"
+    legs["CE_H"] = {"strike": hc[0], "opt": "CE", "sec_id": hc[2], "ltp": hc[1], "expiry": he}
+    legs["PE_H"] = {"strike": hp[0], "opt": "PE", "sec_id": hp[2], "ltp": hp[1], "expiry": he}
+    log(f"प्लॅन {target_delta:.0f}Δ: {note} → Short ({se}) {ce_k}CE @{legs['CE_S']['ltp']} / {pe_k}PE @{legs['PE_S']['ltp']}"
+        f" | {method} ({he}) {hc[0]}CE @{hc[1]} / {hp[0]}PE @{hp[1]}")
+    return legs, method, None
 
 
 def plan_lines(legs):
-    return (f"Short SELL: {legs['CE_S']['strike']} CE @{legs['CE_S']['ltp']} , {legs['PE_S']['strike']} PE @{legs['PE_S']['ltp']}\n"
-            f"Hedge BUY: {legs['CE_H']['strike']} CE @{legs['CE_H']['ltp']} , {legs['PE_H']['strike']} PE @{legs['PE_H']['ltp']}")
+    return (f"Short SELL ({legs['CE_S']['expiry']}): {legs['CE_S']['strike']} CE @{legs['CE_S']['ltp']} , "
+            f"{legs['PE_S']['strike']} PE @{legs['PE_S']['ltp']}\n"
+            f"Hedge BUY ({legs['CE_H']['expiry']}): {legs['CE_H']['strike']} CE @{legs['CE_H']['ltp']} , "
+            f"{legs['PE_H']['strike']} PE @{legs['PE_H']['ltp']}")
 
 
 _last_liq_alert = 0.0
 
 
 def enter_trade(source, use_fallback=False):
-    """True = ट्रेड घेतला, False = नाही, "ASKED" = 20Δ/100 चा पर्याय Telegram वर विचारला."""
-    mid, bw = get_expiries()
-    if not bw:
-        log("Expiry list मिळाली नाही — एंट्री नाही.")
+    """True = ट्रेड घेतला, False = नाही, "ASKED" = 20Δ चा पर्याय Telegram वर विचारला."""
+    global _last_liq_alert
+    mid, se, he = get_expiries()
+    if not he:
+        log("Expiry list (३ expiry) मिळाली नाही — एंट्री नाही.")
         return False
-    spot, oc = fetch_chain(bw)
+    spot, oc_s = get_chain(se, 0)
     if not spot:
         return False
-    days = (datetime.strptime(bw, "%Y-%m-%d").date() - now().date()).days
+    _, oc_h = get_chain(he, 0)
+    if not oc_h:
+        return False
+    ocmap = {se: oc_s, he: oc_h}
+    days = (datetime.strptime(se, "%Y-%m-%d").date() - now().date()).days
     T = max(days, 0.5) / 365.0
-    hd_std, d_fb, hd_fb = int(CFG["HEDGE_DISTANCE"]), float(CFG["FALLBACK_DELTA"]), int(CFG["FALLBACK_HEDGE"])
+    d_fb = float(CFG["FALLBACK_DELTA"])
 
     if use_fallback:
-        legs, err = build_plan(oc, spot, T, bw, d_fb, hd_fb)
+        legs, method, err = build_plan(oc_s, oc_h, spot, T, se, he, d_fb)
         if err:
-            alert(f"❌ {d_fb:.0f}Δ/{hd_fb} प्लॅन बनला नाही: {err}")
+            alert(f"❌ {d_fb:.0f}Δ प्लॅन बनला नाही: {err}")
             return False
-        bad = liquidity_issues(oc, legs)
+        bad = liquidity_issues(ocmap, legs)
         if bad:
-            alert(f"❌ {d_fb:.0f}Δ/{hd_fb} सुद्धा आत्ता liquid नाही — एंट्री रद्द:\n" + "\n".join(bad))
+            alert(f"❌ {d_fb:.0f}Δ सुद्धा आत्ता liquid नाही — एंट्री रद्द:\n" + "\n".join(bad))
             return False
-        return place_entry(legs, bw, mid, f"{d_fb:.0f}Δ / {hd_fb} OTM (पर्याय)", hd_fb, source)
+        return place_entry(legs, se, mid, he, f"{d_fb:.0f}Δ | {method} (पर्याय)", source)
 
-    legs, err = build_plan(oc, spot, T, bw, TARGET_DELTA, hd_std)
+    legs, method, err = build_plan(oc_s, oc_h, spot, T, se, he, TARGET_DELTA)
     if err:
         log(f"[{source}] {err} — एंट्री नाही.")
         return False
-    bad = liquidity_issues(oc, legs)
+    bad = liquidity_issues(ocmap, legs)
     if not bad:
-        return place_entry(legs, bw, mid, f"{TARGET_DELTA:.0f}Δ / {hd_std} OTM", hd_std, source)
+        return place_entry(legs, se, mid, he, f"{TARGET_DELTA:.0f}Δ | {method}", source)
 
-    # 15Δ/200 liquid नाही → 20Δ/100 चा पर्याय विचारा
-    legs2, err2 = build_plan(oc, spot, T, bw, d_fb, hd_fb)
-    bad2 = liquidity_issues(oc, legs2) if legs2 else [err2]
-    head = f"⚠️ {TARGET_DELTA:.0f}Δ / {hd_std} OTM चे strikes liquid नाहीत ({source}):\n" + "\n".join(bad)
+    legs2, method2, err2 = build_plan(oc_s, oc_h, spot, T, se, he, d_fb)
+    bad2 = liquidity_issues(ocmap, legs2) if legs2 else [err2]
+    head = (f"ℹ️ Liquidity कारण ({source}): {TARGET_DELTA:.0f}Δ चे strikes पुरेसे liquid नाहीत —\n" + "\n".join(bad) +
+            "\n(म्हणजे खरेदी-विक्रीच्या भावात मोठी तफावत किंवा खरेदीदार/विक्रेता नाही; अशा strike वर market order महाग पडते)")
     if bad2:
-        global _last_liq_alert
-        msg = head + f"\n\n{d_fb:.0f}Δ / {hd_fb} OTM सुद्धा liquid नाही:\n" + "\n".join(bad2) + "\n→ आत्ता एंट्री नाही (थोड्या वेळाने पुन्हा तपासेन)."
+        msg = head + f"\n\n{d_fb:.0f}Δ सुद्धा liquid नाही:\n" + "\n".join(bad2) + "\n→ आत्ता एंट्री नाही (थोड्या वेळाने पुन्हा तपासेन)."
         if time.time() - _last_liq_alert > 600:
             _last_liq_alert = time.time()
             alert(msg)
         else:
             log(msg.replace("\n", " | "))
         return False
-    ttl = int(CFG["ENTRY_CONFIRM_MIN"]) * 60
-    state["entry_pending"] = {"source": source, "until": time.time() + ttl}
-    save_state()
-    ask_confirm("entry_fallback", {"source": source},
-                head + f"\n\nपर्याय: {d_fb:.0f}Δ + Hedge {hd_fb} OTM (Expiry {bw}, Spot {spot:.0f}):\n" + plan_lines(legs2) +
-                "\n(होकार दिल्यावर त्या क्षणाचे ताजे भाव घेऊन एंट्री होईल)", ttl)
-    return "ASKED"
+    alert(head + f"\n→ म्हणून आपोआप {d_fb:.0f}Δ (ATM च्या थोडं जवळ, जास्त liquid) strikes ने एंट्री करत आहे.")
+    return place_entry(legs2, se, mid, he, f"{d_fb:.0f}Δ | {method2} (Liquidity मुळे)", source)
 
 
 def decline_fallback(why):
@@ -750,11 +858,16 @@ def decline_fallback(why):
     alert(f"❎ 20Δ/100 पर्याय: {why} → {nxt}")
 
 
-def place_entry(legs, bw, mid, plan_name, hd, source):
+def place_entry(legs, bw, mid, he, plan_name, source):
+    global QTY
+    if state.get("pending_lots"):
+        CFG["LOTS"] = int(state["pending_lots"])
+        state["pending_lots"] = None
+    QTY = int(CFG["LOTS"]) * int(CFG["LOT_SIZE"])
     # नवीन ट्रेड नंबर (Sheet मधला Trade ID यावरून)
     state["trade_no"] += 1
     state.update({"legs": {}, "realized": 0.0, "shifts": 0, "expiry": bw, "rollover": mid,
-                  "imbalance": None, "extra_noted": [], "plan": plan_name, "hedge_dist": hd, "loss_alert_level": 0,
+                  "imbalance": None, "extra_noted": [], "plan": plan_name, "hedge_dist": 0, "hedge_expiry": he, "loss_alert_level": 0, "version": "V3", "qty": QTY,
                   "entry_time": now().strftime("%Y-%m-%d %H:%M:%S")})
     save_state()
 
@@ -763,7 +876,7 @@ def place_entry(legs, bw, mid, plan_name, hd, source):
         lg = legs[role]
         ok, px = place(lg["sec_id"], side, lg["ltp"], f"ENTRY_{role}_{side}")
         if not ok:
-            sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, 0, None, _last_oid, "FAILED", plan_name)
+            sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, 0, None, _last_oid, "FAILED", f"{plan_name} | Exp {lg['expiry']}")
             close_legs(list(state["legs"].keys()), {}, typ="ENTRY-UNDO")
             state["in_trade"] = False
             save_state()
@@ -772,7 +885,7 @@ def place_entry(legs, bw, mid, plan_name, hd, source):
             return False
         state["legs"][role] = {**lg, "entry": px}
         save_state()
-        sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, px, None, _last_oid, note=plan_name)
+        sheet_order("ENTRY", role, lg["strike"], lg["opt"], side, QTY, px, None, _last_oid, note=f"{plan_name} | Exp {lg['expiry']}")
         if role == "PE_H":
             time.sleep(0.5)
 
@@ -780,28 +893,34 @@ def place_entry(legs, bw, mid, plan_name, hd, source):
     save_state()
     sheet_trade("OPEN", 0.0, 0.0)
     L = state["legs"]
-    alert(f"🟢 नवीन ट्रेड {trade_id()} ({source}) | प्लॅन: {plan_name}\nExpiry {bw} | Rollover {mid}\n"
-          f"Hedge BUY: {L['CE_H']['strike']} CE @{L['CE_H']['entry']} , {L['PE_H']['strike']} PE @{L['PE_H']['entry']}\n"
-          f"Short SELL: {L['CE_S']['strike']} CE @{L['CE_S']['entry']} , {L['PE_S']['strike']} PE @{L['PE_S']['entry']}\n"
+    cr = L['CE_S']['entry'] + L['PE_S']['entry'] - L['CE_H']['entry'] - L['PE_H']['entry']
+    alert(f"🟢 नवीन ट्रेड {trade_id()} ({source}) | प्लॅन: {plan_name}\nShort expiry {bw} | Hedge expiry {he} | Rollover {mid}\n"
+          f"Hedge BUY ({he}): {L['CE_H']['strike']} CE @{L['CE_H']['entry']} , {L['PE_H']['strike']} PE @{L['PE_H']['entry']}\n"
+          f"Short SELL ({bw}): {L['CE_S']['strike']} CE @{L['CE_S']['entry']} , {L['PE_S']['strike']} PE @{L['PE_S']['entry']}\n"
+          f"निव्वळ {'credit' if cr >= 0 else 'debit (खर्च)'}: {abs(cr):.2f} pts = ₹{abs(cr) * QTY:,.0f}\n"
           f"Qty {QTY} | Target +₹{target_amt():.0f} | {sl_txt()}")
     return True
 
 
 # ---------------- एक्झिट ----------------
+def lots_now():
+    return QTY / float(CFG["LOT_SIZE"]) if CFG.get("LOT_SIZE") else 0
+
+
 def target_amt():
-    return float(CFG["DEPLOYED_CAPITAL"]) * float(CFG["PROFIT_TARGET_PCT"]) / 100.0
+    return float(CFG["TARGET_PER_LOT"]) * lots_now()
 
 
 def sl_amt():
-    return float(CFG["DEPLOYED_CAPITAL"]) * float(CFG["MAX_SL_PCT"]) / 100.0
+    return float(CFG["SL_PER_LOT"]) * lots_now()
 
 
 def sl_on():
-    return bool(CFG.get("USE_STOPLOSS")) and float(CFG["MAX_SL_PCT"]) > 0
+    return float(CFG["SL_PER_LOT"]) > 0
 
 
 def sl_txt():
-    return f"SL -₹{sl_amt():.0f}" if sl_on() else "SL: बंद (फक्त ॲडजस्टमेंट)"
+    return f"SL -₹{sl_amt():.0f}" if sl_on() else "SL: बंद"
 
 
 def max_risk():
@@ -810,32 +929,60 @@ def max_risk():
     if not all(r in L for r in ("CE_S", "PE_S", "CE_H", "PE_H")):
         return None, ""
     credit = (L["CE_S"]["entry"] + L["PE_S"]["entry"] - L["CE_H"]["entry"] - L["PE_H"]["entry"]) * QTY
-    w_ce = L["CE_H"]["strike"] - L["CE_S"]["strike"]
-    w_pe = L["PE_S"]["strike"] - L["PE_H"]["strike"]
+    w_ce = max(0, L["CE_H"]["strike"] - L["CE_S"]["strike"])
+    w_pe = max(0, L["PE_S"]["strike"] - L["PE_H"]["strike"])
     ce_worst = state["realized"] + credit - w_ce * QTY
     pe_worst = state["realized"] + credit - w_pe * QTY
     return (ce_worst, f"CE बाजू, अंतर {w_ce}") if ce_worst < pe_worst else (pe_worst, f"PE बाजू, अंतर {w_pe}")
 
 
-def current_ltps():
-    spot, oc = fetch_chain(state["expiry"])
+def all_ltps(hedge_age=0.0):
+    """Short expiry ची chain ताजी, Hedge expiry ची hedge_age सेकंदांपर्यंत जुनी चालते. (spot, short_oc, ltp)."""
+    se = state["expiry"]
+    spot, oc = get_chain(se, 0)
     out = {}
-    if oc:
-        for r, lg in state["legs"].items():
-            out[r] = leg_info(oc, lg["strike"], lg["opt"])[0]
+    if not oc:
+        return None, None, out
+    chains = {se: oc}
+    for r, lg in state["legs"].items():
+        e = lg.get("expiry") or se
+        if e not in chains:
+            _, oc2 = get_chain(e, hedge_age)
+            chains[e] = oc2 or {}
+        out[r] = leg_info(chains[e], lg["strike"], lg["opt"])[0] if chains[e] else 0.0
     return spot, oc, out
 
 
+def current_ltps():
+    return all_ltps(0.0)
+
+
+def reentry_time(exit_ts=None):
+    """नियम: १५ मिनिटं cooling. ९:१८-९:३४ एक्झिट → ९:३५. ३:१० नंतर एक्झिट → ३:१४ (किंवा १ मिनिटाने).
+    ३:२५ नंतर येत असेल तर आज नाही (None)."""
+    from datetime import timedelta
+    ex = datetime.fromtimestamp(exit_ts or time.time(), IST)
+    h = (ex.hour, ex.minute)
+    if h < MORNING_REENTRY_END:
+        at = ex.replace(hour=9, minute=35, second=0, microsecond=0)
+    elif h >= (15, 10):
+        at = ex.replace(hour=EOD_REENTRY[0], minute=EOD_REENTRY[1], second=0, microsecond=0)
+        if at <= ex:
+            at = ex + timedelta(minutes=1)
+    else:
+        at = ex + timedelta(minutes=int(CFG["REENTRY_COOL_MIN"]))
+    if (at.hour, at.minute) >= LAST_NEW_ENTRY:
+        return None
+    return at
+
+
 def schedule_reentry(msg, wait_sec=None):
-    if wait_sec is None:
-        wait_sec = float(CFG["REENTRY_WAIT_MIN"]) * 60
-    at = time.time() + float(wait_sec)
-    at_dt = datetime.fromtimestamp(at, IST)
-    if hm(at_dt) < LAST_NEW_ENTRY:
-        state["reentry_at"] = at
-        return msg + f"\n⏳ री-एंट्री {at_dt.strftime('%H:%M:%S')} ला (त्याच expiry मध्ये)."
+    at = reentry_time()
+    if at:
+        state["reentry_at"] = at.timestamp()
+        return msg + f"\n⏳ नवीन ट्रेड {at.strftime('%H:%M:%S')} ला (cooling — fund adjustment साठी वेळ)."
     state["reentry_at"] = 0.0
-    return msg + "\n⏳ आज वेळ संपली — पुढच्या ट्रेडिंग दिवशी ९:३५ ला नवीन ट्रेड."
+    return msg + "\n⏳ आज नवीन ट्रेडची वेळ संपली (३:२५ नंतर) — पुढच्या ट्रेडिंग दिवशी ९:३५ ला."
 
 
 def full_exit(reason, reentry, ltps=None, qtys=None):
@@ -876,11 +1023,10 @@ def calc_pnl(ltp):
 
 def monitor():
     global _last_status, _last_sheet_status
-    spot, oc = fetch_chain(state["expiry"])
+    spot, oc, ltp = all_ltps(15.0)
     if not spot:
         return
     L = state["legs"]
-    ltp = {r: leg_info(oc, L[r]["strike"], L[r]["opt"])[0] for r in L}
     if ltp.get("CE_S", 0) <= 0 or ltp.get("PE_S", 0) <= 0:
         return
     for r in ("CE_H", "PE_H"):
@@ -897,37 +1043,30 @@ def monitor():
         _last_sheet_status = time.time()
         sheet_trade("OPEN", unreal, net)
 
-    # Gap नियम: ९:१५-९:१७ फक्त निरीक्षण
+    # ९:१५-९:१७ no-action zone
     if hm() < GAP_WATCH_END:
         return
 
     if net >= target_amt():
-        full_exit(f"Target +{CFG['PROFIT_TARGET_PCT']}% (Net ₹{net:.0f})", int(CFG["TARGET_REENTRY_SEC"]) or 1, ltp, imbalance_qtys())
+        full_exit(f"Target ₹{CFG['TARGET_PER_LOT']:.0f}/लॉट (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
         return
     if sl_on() and net <= -sl_amt():
-        full_exit(f"Max SL -{CFG['MAX_SL_PCT']}% (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
+        full_exit(f"Stop-loss ₹{CFG['SL_PER_LOT']:.0f}/लॉट (Net ₹{net:.0f})", True, ltp, imbalance_qtys())
         return
-    # SL बंद: तोट्याचे फक्त इशारे (प्रत्येक नवीन पायरीवर एकदा), एक्झिट नाही
-    step = float(CFG["DEPLOYED_CAPITAL"]) * float(CFG["LOSS_ALERT_STEP_PCT"]) / 100.0
-    if step > 0 and net < 0:
-        lvl = int(-net // step)
-        if lvl > int(state.get("loss_alert_level") or 0):
-            state["loss_alert_level"] = lvl
-            save_state()
-            risk, side = max_risk()
-            alert(f"⚠️ तोटा इशारा ({trade_id()}): Net ₹{net:.0f} (−₹{lvl * step:.0f} ची पायरी ओलांडली). SL बंद आहे — बॉट ॲडजस्टमेंट चालू ठेवेल.\n"
-                  + (f"Hedge मुळे expiry ला कमाल धोका: ₹{risk:.0f} ({side}).\n" if risk is not None else "")
-                  + "हाताने बंद करायचे असल्यास /exit")
 
-    if state.get("imbalance"):      # असंतुलन असताना 2x शिफ्टिंग थांबलेली
+    if state.get("imbalance"):      # असंतुलन असताना ॲडजस्टमेंट थांबलेली
         return
+    eh, em = divmod(int(CFG["EOD_CHECK_HHMM"]), 100)
+    late = hm() >= (eh, em)
+    thr = float(CFG["EOD_RATIO"]) if late else 2.0
+    typ = "EOD-ADJ" if late else "SHIFT"
     ce, pe = ltp["CE_S"], ltp["PE_S"]
-    if pe >= 2.0 * ce:
-        log(f"⚡ 2x Trigger: PE @{pe} ≥ 2 × CE @{ce}")
-        auto_shift("CE", pe, spot, oc, ltp)
-    elif ce >= 2.0 * pe:
-        log(f"⚡ 2x Trigger: CE @{ce} ≥ 2 × PE @{pe}")
-        auto_shift("PE", ce, spot, oc, ltp)
+    if pe >= thr * ce - 1e-9:
+        log(f"⚡ {thr}x Trigger: PE @{pe} ≥ {thr} × CE @{ce}")
+        auto_shift("CE", pe, spot, oc, ltp, typ)
+    elif ce >= thr * pe - 1e-9:
+        log(f"⚡ {thr}x Trigger: CE @{ce} ≥ {thr} × PE @{pe}")
+        auto_shift("PE", ce, spot, oc, ltp, typ)
 
 
 def plan_shift(side, spot, oc, target_prem=None, strike=None):
@@ -962,10 +1101,28 @@ def plan_shift(side, spot, oc, target_prem=None, strike=None):
     return new_k, new_ltp, sid, None
 
 
-def execute_shift(side, new_k, new_ltp, sid, ltp, typ, target_note=""):
-    role = f"{side}_S"
+def execute_shift(side, new_k, new_ltp, sid, ltp, typ, target_note="", spot=None):
+    """लहान बाजू बदलणे: जुना Short BUY → जुना Hedge SELL → नवीन Hedge BUY (Hedge expiry) → नवीन Short SELL."""
+    role, hrole = f"{side}_S", f"{side}_H"
     L = state["legs"]
     old = L[role]
+    spot = spot or LAST.get("spot") or 0
+    he = hedge_expiry()
+    if not he:
+        alert("शिफ्ट: Hedge expiry ठरली नाही — पुढच्या फेरीत पुन्हा.")
+        return False
+    _, oc_h = get_chain(he, 0)
+    if not oc_h:
+        alert("शिफ्ट: Hedge expiry चे भाव मिळाले नाहीत — पुढच्या फेरीत पुन्हा.")
+        return False
+    nh = fallback_hedge(oc_h, he, new_k, side)
+    hmeth = f"±{CFG['HEDGE_FALLBACK_OTM']} OTM"
+    if not nh:
+        alert(f"शिफ्ट: नवीन {side} Hedge ({he}) सापडला नाही — पुढच्या फेरीत पुन्हा.")
+        return False
+    hk, h_ltp, h_sid = nh
+
+    # १) जुना Short BUY (बुक)
     ok, px = place(old["sec_id"], "BUY", ltp.get(role) or old["entry"], f"{typ}_BOOK_{side}")
     if not ok:
         sheet_order(f"{typ} BOOK", role, old["strike"], side, "BUY", QTY, 0, None, _last_oid, "FAILED")
@@ -976,32 +1133,74 @@ def execute_shift(side, new_k, new_ltp, sid, ltp, typ, target_note=""):
     sheet_order(f"{typ} BOOK", role, old["strike"], side, "BUY", QTY, px, booked, _last_oid)
     L.pop(role)
     save_state()
+
+    # २) जुना Hedge SELL
+    hb = 0.0
+    if hrole in L:
+        oh = L[hrole]
+        oe = oh.get("expiry") or state["expiry"]
+        oc_old = oc_h if oe == he else (get_chain(oe, 0)[1] or {})
+        oh_ltp = leg_info(oc_old, oh["strike"], side)[0] if oc_old else 0.0
+        ok, hpx = place(oh["sec_id"], "SELL", oh_ltp or ltp.get(hrole) or oh["entry"], f"{typ}_HEDGEOUT_{side}")
+        if not ok:
+            sheet_order(f"{typ} HEDGE-OUT", hrole, oh["strike"], side, "SELL", QTY, 0, None, _last_oid, "FAILED")
+            halt(f"शिफ्ट: जुना {oh['strike']}{side} Hedge विकता आला नाही. नवीन Short विकला नाही.")
+            return False
+        hb = (hpx - oh["entry"]) * QTY
+        state["realized"] += hb
+        sheet_order(f"{typ} HEDGE-OUT", hrole, oh["strike"], side, "SELL", QTY, hpx, hb, _last_oid,
+                    note=f"Exp {oh.get('expiry') or state['expiry']}")
+        L.pop(hrole)
+        save_state()
+
+    # ३) नवीन Hedge BUY (Hedge expiry)
+    ok, hpx2 = place(h_sid, "BUY", h_ltp, f"{typ}_HEDGEIN_{side}")
+    if not ok:
+        sheet_order(f"{typ} HEDGE-IN", hrole, hk, side, "BUY", QTY, 0, None, _last_oid, "FAILED", f"Exp {he}")
+        full_exit(f"शिफ्ट: नवीन {hk}{side} Hedge घेता आला नाही — सुरक्षेसाठी पूर्ण एक्झिट", False, ltp)
+        halt("शिफ्ट मधली Hedge BUY ऑर्डर अयशस्वी.")
+        return False
+    L[hrole] = {"strike": hk, "opt": side, "sec_id": h_sid, "entry": hpx2, "expiry": he}
+    save_state()
+    sheet_order(f"{typ} HEDGE-IN", hrole, hk, side, "BUY", QTY, hpx2, None, _last_oid, note=f"Hedge {hmeth} | Exp {he}")
+
+    # ४) नवीन Short SELL
     ok, px2 = place(sid, "SELL", new_ltp, f"{typ}_NEW_{side}")
     if not ok:
         sheet_order(f"{typ} NEW", role, new_k, side, "SELL", QTY, 0, None, _last_oid, "FAILED")
         full_exit(f"शिफ्ट: नवीन {new_k}{side} विकता आला नाही — सुरक्षेसाठी पूर्ण एक्झिट", False, ltp)
         halt("शिफ्ट मधली SELL ऑर्डर अयशस्वी.")
         return False
-    L[role] = {"strike": new_k, "opt": side, "sec_id": sid, "entry": px2}
+    L[role] = {"strike": new_k, "opt": side, "sec_id": sid, "entry": px2, "expiry": state["expiry"]}
     state["shifts"] += 1
     save_state()
-    sheet_order(f"{typ} NEW", role, new_k, side, "SELL", QTY, px2, None, _last_oid, note=target_note)
-    unreal, net = calc_pnl(ltp)
+    sheet_order(f"{typ} NEW", role, new_k, side, "SELL", QTY, px2, None, _last_oid, note=f"{target_note} | Exp {state['expiry']}")
+    ltp2 = dict(ltp)
+    for r2, lg2 in L.items():
+        if lg2.get("expiry") == he:
+            p2 = leg_info(oc_h, lg2["strike"], lg2["opt"])[0]
+            if p2 > 0:
+                ltp2[r2] = p2
+    ltp2[role], ltp2[hrole] = px2, hpx2
+    unreal, net = calc_pnl(ltp2)
+    LAST.update({"ltp": ltp2, "unreal": unreal, "net": net})
     sheet_trade("OPEN", unreal, net)
-    alert(f"🔁 {typ} #{state['shifts']} ({trade_id()}): {old['strike']}{side} बुक (₹{booked:.0f}) → नवीन {new_k}{side} SELL @{px2} "
-          f"{target_note} | Booked एकूण ₹{state['realized']:.0f}")
+    alert(f"🔁 {typ} #{state['shifts']} ({trade_id()}) {side} बाजू:\n"
+          f"Short {old['strike']}{side} बुक (₹{booked:.0f}) → नवीन {new_k}{side} SELL @{px2} {target_note}\n"
+          f"Hedge बदल (₹{hb:.0f}) → नवीन {hk}{side} ({he}) BUY @{hpx2} [{hmeth}]\n"
+          f"Booked एकूण ₹{state['realized']:.0f}")
     return True
 
 
 def auto_shift(side, target_prem, spot, oc, ltp, typ="SHIFT"):
     new_k, new_ltp, sid, err = plan_shift(side, spot, oc, target_prem=target_prem)
     if err and err.startswith("Strike Limit"):
-        full_exit(f"Strike Limit (नियम ५.४): {err}", True, ltp)
+        full_exit(f"ITM/Overlap/Straddle एक्झिट: {err}", True, ltp)
         return
     if err:
         log(f"शिफ्ट पुढे ढकलली: {err}")
         return
-    execute_shift(side, new_k, new_ltp, sid, ltp, typ, f"(हवा होता {target_prem})")
+    execute_shift(side, new_k, new_ltp, sid, ltp, typ, f"(हवा होता {target_prem})", spot)
 
 
 def eod_check():
@@ -1188,6 +1387,7 @@ HELP = """🤖 IC बॉट commands
 /adjust ce  किंवा  /adjust pe — ती बाजू हलवा
 /shift ce 24300 — CE short त्या strike वर
 /fix — qty असंतुलन बॉट स्वतः भरून काढेल
+/lots — चालू लॉट पाहा | /lots 12 — लॉट बदला (पुढच्या ट्रेडपासून)
 /yes /no — प्लॅनला होकार / नकार"""
 
 
@@ -1232,7 +1432,7 @@ def status_text():
                  + (f"SL -₹{sl_amt():.0f} (बाकी ₹{LAST['net'] + sl_amt():.0f})" if sl_on() else "SL: बंद"))
     risk, side = max_risk()
     if risk is not None:
-        lines.append(f"Hedge मुळे expiry ला कमाल धोका: ₹{risk:.0f} ({side})")
+        lines.append(f"Hedge मुळे कमाल धोका (अंदाजे): ₹{risk:.0f} ({side})")
     return "\n".join(lines)
 
 
@@ -1294,13 +1494,15 @@ def positions_text():
 
 
 def settings_text():
-    return (f"⚙️ {BOT_VERSION} | {'PAPER' if PAPER else 'LIVE'}\nLots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY}\n"
-            f"Capital ₹{CFG['DEPLOYED_CAPITAL']} | Target {CFG['PROFIT_TARGET_PCT']}% | "
-            f"{('SL ' + str(CFG['MAX_SL_PCT']) + '%') if sl_on() else 'SL: बंद'} | तोटा इशारा दर {CFG['LOSS_ALERT_STEP_PCT']}%\n"
-            f"Hedge {CFG['HEDGE_DISTANCE']} pts | री-एंट्री: Target नंतर {CFG['TARGET_REENTRY_SEC']} सेकंद, Strike Limit नंतर {CFG['REENTRY_WAIT_MIN']} मि. | Balance वेळ {BALANCE_WAIT_MIN} मि.\n"
-            f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | पर्याय {CFG['FALLBACK_DELTA']:.0f}Δ / {CFG['FALLBACK_HEDGE']} OTM\n"
-            f"दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'} | दिवसअखेर तपासणी {int(CFG['EOD_CHECK_HHMM']) // 100}:{int(CFG['EOD_CHECK_HHMM']) % 100:02d} ≥ {CFG['EOD_RATIO']}x\n"
-            f"Gap निरीक्षण ९:१५-९:१७ | TOTP: {'✅' if totp_enabled() else '❌'} | Sheet: {'✅' if CFG.get('SHEET_WEBHOOK_URL') else '❌'}")
+    pend = f" (पुढच्या ट्रेडपासून {state['pending_lots']} लॉट)" if state.get("pending_lots") else ""
+    return (f"⚙️ {BOT_VERSION} | {'PAPER' if PAPER else 'LIVE'}\n"
+            f"Lots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {int(CFG['LOTS']) * int(CFG['LOT_SIZE'])}{pend} | चालू ट्रेड Qty {QTY}\n"
+            f"Target ₹{CFG['TARGET_PER_LOT']:.0f}/लॉट (₹{target_amt():.0f}) | SL ₹{CFG['SL_PER_LOT']:.0f}/लॉट (₹{sl_amt():.0f})\n"
+            f"Sell: दुसरी expiry, 15Δ पैकी कमी premium base | Hedge: पुढची expiry, Short ± {CFG['HEDGE_FALLBACK_OTM']} OTM\n"
+            f"ॲडजस्टमेंट: 2x (९:१८-३:०९), 1.65x (३:१० पासून, कितीही वेळा) | ITM/Overlap/Straddle → एक्झिट\n"
+            f"री-एंट्री: {CFG['REENTRY_COOL_MIN']} मि. cooling | सकाळी (९:१८-९:३४) → ९:३५ | ३:१० नंतर → ३:१४ | ३:२५ नंतर नाही\n"
+            f"Liquidity: spread ≤ {CFG['LIQ_MAX_SPREAD_PCT']}% (किमान ₹{CFG['LIQ_MIN_SPREAD_RS']}) | नसेल तर आपोआप {CFG['FALLBACK_DELTA']:.0f}Δ\n"
+            f"No-action ९:१५-९:१७ | दर तासाला status: {'✅' if CFG['HOURLY_STATUS'] else '❌'} | TOTP: {'✅' if totp_enabled() else '❌'} | Sheet: {'✅' if CFG.get('SHEET_WEBHOOK_URL') else '❌'}")
 
 
 def log_text():
@@ -1336,7 +1538,8 @@ def plan_adjust(side=None, strike=None):
     b = (old["entry"] - ltp[f"{side}_S"]) * QTY
     txt = (f"{old['strike']}{side} @ {ltp[f'{side}_S']:.2f} → BUY (बुक ₹{b:.0f})\n"
            f"नवीन: {new_k}{side} @ {new_ltp:.2f} → SELL\n"
-           f"दुसरी बाजू: {state['legs'][other]['strike']} @ {ltp[other]:.2f}\nStrike Limit तपासणी: ✅")
+           f"दुसरी बाजू: {state['legs'][other]['strike']} @ {ltp[other]:.2f}\nStrike Limit तपासणी: ✅\n"
+           f"{side} Hedge सुद्धा बदलेल: जुना बंद → नवीन ({hedge_expiry()}) premium +{CFG['HEDGE_PREM_ADD_MIN']:.0f} ते +{CFG['HEDGE_PREM_ADD_MAX']:.0f} (नाहीतर ±{CFG['HEDGE_FALLBACK_OTM']} OTM)")
     if strike is not None and new_ltp >= 2 * ltp[other]:
         txt += "\n⚠️ नवीन premium दुसऱ्या बाजूच्या दुप्पट होईल → पुढच्या फेरीत 2x ॲडजस्टमेंट होईल."
     ask_confirm("adjust", {"side": side, "new_k": new_k, "sid": sid}, txt)
@@ -1398,6 +1601,18 @@ def handle_command(cid, txt, name):
         if not imb:
             return tg("सध्या कोणतंही असंतुलन नाही ✅")
         ask_confirm("fix", {"need": imb["need"]}, "बॉट या ऑर्डर टाकेल:\n" + need_text(imb["need"]))
+    elif cmd == "/lots":
+        if len(parts) < 2:
+            pend = f"\nपुढच्या ट्रेडपासून: {state['pending_lots']} लॉट" if state.get("pending_lots") else ""
+            return tg(f"📦 लॉट: {CFG['LOTS']} × {CFG['LOT_SIZE']} = {int(CFG['LOTS']) * int(CFG['LOT_SIZE'])} qty"
+                      f" | चालू ट्रेड qty {QTY}{pend}\nबदलायला: /lots 12")
+        if not parts[1].isdigit() or not (1 <= int(parts[1]) <= int(CFG["MAX_LOTS"])):
+            return tg(f"लॉट १ ते {CFG['MAX_LOTS']} मध्ये हवेत. उदा. /lots 12")
+        n = int(parts[1])
+        when = "चालू ट्रेड संपल्यावर, पुढच्या नवीन ट्रेडपासून" if state["in_trade"] else "लगेच (पुढचा ट्रेड)"
+        ask_confirm("lots", {"n": n},
+                    f"लॉट {CFG['LOTS']} → {n} ({n * int(CFG['LOT_SIZE'])} qty)\nलागू: {when}\n"
+                    f"नवीन Target ₹{n * float(CFG['TARGET_PER_LOT']):.0f} | SL ₹{n * float(CFG['SL_PER_LOT']):.0f}")
     elif cmd == "/yes":
         if not PENDING:
             return tg("पक्कं करायला कोणताही प्लॅन नाही (किंवा ६० सेकंद उलटले).")
@@ -1427,6 +1642,19 @@ def run_pending(p):
         if not enter_trade(d.get("source", "") + " + 20Δ/100 पर्याय", use_fallback=True):
             decline_fallback("एंट्री होऊ शकली नाही")
         return
+    if kind == "lots":
+        global QTY
+        n = int(d["n"])
+        save_config_value("LOTS", n)
+        if state["in_trade"]:
+            state["pending_lots"] = n
+            save_state()
+            return alert(f"📦 लॉट {n} नोंदवले — चालू ट्रेड {QTY} qty ने चालू राहील, पुढचा ट्रेड {n * int(CFG['LOT_SIZE'])} qty ने.")
+        CFG["LOTS"] = n
+        state["pending_lots"] = None
+        save_state()
+        QTY = n * int(CFG["LOT_SIZE"])
+        return alert(f"📦 लॉट {n} लागू ({QTY} qty). Target ₹{target_amt():.0f} | SL ₹{sl_amt():.0f}")
     if kind == "exit":
         state["paused"] = True
         save_state()
@@ -1439,7 +1667,7 @@ def run_pending(p):
         if not spot:
             return tg("भाव मिळाले नाहीत — रद्द.")
         new_ltp = leg_info(oc, d["new_k"], d["side"])[0]
-        execute_shift(d["side"], d["new_k"], new_ltp, d["sid"], ltp, "MANUAL-ADJ", "(Telegram /adjust)")
+        execute_shift(d["side"], d["new_k"], new_ltp, d["sid"], ltp, "MANUAL-ADJ", "(Telegram /adjust)", spot)
     elif kind == "fix":
         L = state["legs"]
         spot, oc, ltp = current_ltps()
@@ -1495,7 +1723,7 @@ def startup_checks():
     log("=" * 60)
     log(f"NIFTY 15Δ IRON CONDOR BOT {BOT_VERSION} | मोड: {'📝 PAPER (खोट्या ऑर्डर)' if PAPER else '💰 LIVE (खऱ्या ऑर्डर)'}")
     log(f"Lots {CFG['LOTS']} × {CFG['LOT_SIZE']} = {QTY} Qty | Capital ₹{CFG['DEPLOYED_CAPITAL']} | "
-        f"Target +₹{target_amt():.0f} | {sl_txt()} | Hedge {CFG['HEDGE_DISTANCE']} pts")
+        f"Target +₹{target_amt():.0f} | {sl_txt()} | Hedge: पुढची expiry, +{CFG['HEDGE_PREM_ADD_MIN']:.0f}..{CFG['HEDGE_PREM_ADD_MAX']:.0f} / ±{CFG['HEDGE_FALLBACK_OTM']}")
     tok = str(CFG["DHAN_ACCESS_TOKEN"])
     log(f"Client {CFG['DHAN_CLIENT_ID']} | Token {tok[:8]}...{tok[-6:]} | State: {os.path.basename(STATE_FILE)} | "
         f"TOTP {'✅' if totp_enabled() else '❌'} | Telegram {'✅' if CFG.get('TELEGRAM_CHAT_ID') else '❌'} | "
@@ -1537,6 +1765,10 @@ def main():
     threading.Thread(target=_tg_poller, daemon=True).start()
     build_client()
     load_state()
+    if state.get("in_trade") and int(state.get("qty") or 0) > 0:
+        QTY = int(state["qty"])              # चालू ट्रेड ज्या qty ने घेतला त्याच qty ने सांभाळायचा
+    if state.get("force_exit_old"):
+        alert("ℹ️ V3.0: जुन्या नियमांचा चालू ट्रेड सापडला — मार्केट उघडल्यावर (९:१८ नंतर) तो बंद करून नवीन नियमांनी नवीन ट्रेड घेतला जाईल.")
     startup_checks()
     alert(f"🚀 बॉट सुरू {BOT_VERSION} ({'PAPER' if PAPER else 'LIVE'}) — {QTY} Qty. Commands साठी /help")
 
@@ -1570,6 +1802,13 @@ def main():
                 continue
 
             t = today_str()
+            if state.get("force_exit_old") and state["in_trade"] and hm(n) >= GAP_WATCH_END and not state["halted"]:
+                state["force_exit_old"] = False
+                save_state()
+                full_exit("V3.0 सुरू — जुन्या नियमांचा ट्रेड बंद", True)
+            elif state.get("force_exit_old") and not state["in_trade"]:
+                state["force_exit_old"] = False
+                save_state()
             hk = n.strftime("%Y-%m-%d %H")
             if CFG["HOURLY_STATUS"] and n.minute == 0 and 10 <= n.hour <= 15 and state.get("last_hourly") != hk:
                 state["last_hourly"] = hk
@@ -1609,10 +1848,6 @@ def main():
                 broker_check()
                 if state["in_trade"] and not state["halted"]:
                     monitor()
-                    eh, em = divmod(int(CFG["EOD_CHECK_HHMM"]), 100)
-                    if state["in_trade"] and not state["halted"] and hm(n) >= (eh, em) \
-                            and state.get("eod_check_day") != t:
-                        eod_check()
                     if state["in_trade"] and state["imbalance"] and time.time() >= state["imbalance"]["deadline"]:
                         broker_check()
             time.sleep(LOOP_SLEEP)

@@ -1,6 +1,6 @@
-# ================= Nitin Iron Condor Bot — config.py =================
+# ================= Nitin IC Bot V3.0 — config.py =================
 # फक्त या file मध्ये बदल करायचे. bot.py ला हात लावायचा नाही.
-# बदल केल्यावर: Token बदलला तर बॉट आपोआप घेतो (restart नको).
+# Token/Telegram/Sheet बदलले तर बॉट आपोआप घेतो. लॉट Telegram वर /lots 12 ने बदला.
 # बाकी कोणताही बदल केला तर:  sudo systemctl restart icbot
 
 DHAN_CLIENT_ID = "तुमचा_CLIENT_ID"
@@ -10,38 +10,45 @@ DHAN_TOTP_SECRET = ""      # setup_totp.py भरेल — GitHub वर कध
 
 PAPER_MODE = True          # True = खोट्या ऑर्डर (टेस्ट)   |   False = खऱ्या ऑर्डर (LIVE)
 
-LOTS = 8                   # NIFTY लॉट
+LOTS = 12                  # NIFTY लॉट (Telegram: /lots 12)
 LOT_SIZE = 65              # NIFTY चा १ लॉट
-DEPLOYED_CAPITAL = 600000  # ₹ भांडवल
-PROFIT_TARGET_PCT = 1.25   # एकूण नफा या % ला पोहोचला की पूर्ण एक्झिट
-MAX_SL_PCT = 1.25          # एकूण तोटा या % ला पोहोचला की पूर्ण एक्झिट
-HEDGE_DISTANCE = 200       # Short strike पासून Hedge किती points बाहेर
-REENTRY_WAIT_MIN = 5       # Target/SL/Strike-limit नंतर किती मिनिटांनी री-एंट्री
+MAX_LOTS = 27              # /lots ची कमाल मर्यादा (27 × 65 = 1755, NSE freeze 1800 च्या आत)
 
-# ---- Liquidity पर्याय (V1.2) — या ओळी नसल्या तरी हेच मूल्य वापरले जाते ----
-FALLBACK_DELTA = 20        # 15Δ/200 liquid नसेल तर Telegram वर विचारायचा पर्याय: हा Delta
-FALLBACK_HEDGE = 100       # ... आणि हा Hedge अंतर
+# ---- Target / Stop-loss (प्रति लॉट) ----
+TARGET_PER_LOT = 1100      # 12 लॉट → +₹13,200
+SL_PER_LOT = 1800          # 12 लॉट → −₹21,600
+
+# ---- Hedge ----
+HEDGE_FALLBACK_OTM = 100   # Short पासून इतके points OTM, पुढच्या expiry मध्ये
+
+# ---- ॲडजस्टमेंट ----
+EOD_RATIO = 1.65           # या वेळेपासून 2x ऐवजी 1.65x (कितीही वेळा)
+EOD_CHECK_HHMM = 1510      # १५:१०
+
+# ---- री-एंट्री ----
+REENTRY_COOL_MIN = 15      # एक्झिटनंतर cooling (सकाळी ९:३५ / ३:१० नंतर ३:१४ हे अपवाद)
+
+# ---- Liquidity ----
+FALLBACK_DELTA = 20        # 15Δ liquid नसेल तर आपोआप हा Delta (फक्त Telegram वर माहिती)
 LIQ_MAX_SPREAD_PCT = 5.0   # bid-ask spread LTP च्या या % पेक्षा जास्त = illiquid
 LIQ_MIN_SPREAD_RS = 1.0    # पण ₹1 पर्यंतचा spread नेहमी चालेल
-LIQ_MIN_OI = 0             # किमान OI (आत्ता बंद — Paper नंतर ठरवू)
-ENTRY_CONFIRM_MIN = 10     # पर्यायाला /yes देण्यासाठी किती मिनिटं
+LIQ_MIN_OI = 0
+
 HOURLY_STATUS = True       # दर तासाला (१०:०० ते ३:००) Telegram वर status
 
-# ---- Stop-loss (V1.3) ----
-USE_STOPLOSS = False       # False = SL बंद: फक्त Target ला बुक, बाकी वेळ ॲडजस्टमेंट  |  True = MAX_SL_PCT ला एक्झिट
-LOSS_ALERT_STEP_PCT = 1.25 # SL बंद असताना तोटा दर एवढ्या % ने वाढला की Telegram इशारा (एक्झिट नाही)
-TARGET_REENTRY_SEC = 15    # Target बुक झाल्यावर किती सेकंदांनी नवीन एंट्री
-EOD_RATIO = 1.65           # दिवसअखेर तपासणी: मोठा premium ≥ एवढे × लहान असेल तर आजच ॲडजस्टमेंट
-EOD_CHECK_HHMM = 1510      # तपासणीची वेळ (१५:१०)
+# ---- जुन्या आवृत्तीच्या ओळी (V3.0 मध्ये वापरात नाहीत, पण असल्या पाहिजेत) ----
+DEPLOYED_CAPITAL = 600000
+PROFIT_TARGET_PCT = 1.25
+MAX_SL_PCT = 1.25
+HEDGE_DISTANCE = 200
+REENTRY_WAIT_MIN = 15
 
-# NSE सुट्ट्या (YYYY-MM-DD) — NSE च्या वेबसाईटवर तपासून यादी पूर्ण करा
-HOLIDAYS = ["2026-11-24", "2026-12-25"]
+# NSE सुट्ट्या (कोडमध्ये १० नोव्हें., २४ नोव्हें., २५ डिसें. आधीच आहेत) — जास्तीच्या असल्यास इथे
+HOLIDAYS = []
 
-# Telegram alert (ऐच्छिक — रिकामे ठेवले तर alert जाणार नाहीत)
+# Telegram / Google Sheet (setup_extras.py भरेल)
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
-
-# Google Sheet (ऐच्छिक — setup_extras.py भरेल)
 SHEET_WEBHOOK_URL = ""
 SHEET_SECRET = ""
 
