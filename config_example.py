@@ -1,4 +1,4 @@
-# ================= Nitin IC Bot V3.1 — config.py =================
+# ================= Nitin IC Bot V3.2 — config.py =================
 # फक्त या file मध्ये बदल करायचे. bot.py ला हात लावायचा नाही.
 # Token/Telegram/Sheet बदलले तर बॉट आपोआप घेतो. लॉट Telegram वर /lots 12 ने बदला.
 # बाकी कोणताही बदल केला तर:  sudo systemctl restart icbot
@@ -19,7 +19,7 @@ TARGET_PER_LOT = 1100      # 12 लॉट → +₹13,200
 SL_PER_LOT = 1800          # 12 लॉट → −₹21,600
 
 # ---- Hedge ----
-HEDGE_FALLBACK_OTM = 100   # Short पासून इतके points OTM, पुढच्या expiry मध्ये
+HEDGE_FALLBACK_OTM = 200   # Short पासून इतके points OTM, पुढच्या expiry मध्ये
 
 # ---- ॲडजस्टमेंट ----
 EOD_RATIO = 1.65           # या वेळेपासून 2x ऐवजी 1.65x (कितीही वेळा)

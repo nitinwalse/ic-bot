@@ -2,7 +2,8 @@
 """
 =====================================================================
  Nitin — NIFTY Bi-Weekly 15 Delta Hedged Iron Condor Bot
- Version : V3.1  (04-11-2026)  — अंतिम नियमावली V3.1
+ Version : V3.2  (04-11-2026)  — अंतिम नियमावली V3.2
+   + Hedge: Short ± 200 OTM (100 वरून), पुढच्या expiry मध्ये
    + Delta शिडी: 15Δ चा base strike 50 च्या पटीत / illiquid असेल तर 16, 17 ... 25Δ (दोन्ही बाजू एकाच Delta ने)
    + Sell: 15Δ पैकी कमी premium base | Hedge: Short ± 100 OTM, पुढच्या expiry मध्ये
    + Target ₹1,100/लॉट, SL ₹1,800/लॉट | ९:१५-९:१७ no-action, ९:१८ पासून निर्णय
@@ -30,7 +31,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dhanhq import DhanContext, dhanhq, DhanLogin
 
-BOT_VERSION = "V3.1"
+BOT_VERSION = "V3.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.py")
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
@@ -71,7 +72,7 @@ NUM_KEYS = {"FALLBACK_DELTA": 20.0, "FALLBACK_HEDGE": 100, "LIQ_MAX_SPREAD_PCT":
             "EOD_RATIO": 1.65, "EOD_CHECK_HHMM": 1510, "TARGET_PER_LOT": 1100.0, "SL_PER_LOT": 1800.0,
             "REENTRY_COOL_MIN": 15, "MAX_LOTS": 27, "DELTA_MAX": 25,
             "HEDGE_PREM_ADD_MIN": 10.0, "HEDGE_PREM_ADD_MAX": 20.0, "HEDGE_PREM_ADD_TARGET": 15.0,
-            "HEDGE_FALLBACK_OTM": 100}
+            "HEDGE_FALLBACK_OTM": 200}
 ROLE_NAME = {"CE_S": "Short CE", "PE_S": "Short PE", "CE_H": "Hedge CE", "PE_H": "Hedge PE"}
 
 # ---------------- Logging (IST वेळेत) ----------------
